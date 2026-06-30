@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Audit-runtime state
+.last_target
+.cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Sessions — keep the folder but only commit example sessions explicitly
+# sessions/*/      ← uncomment to exclude all session output
+
+# uv
+.uv/
+uv.lock

@@ -1,0 +1,1279 @@
+# Gym Audit Rubric — baseline-grounded against gym-cua-anthropic
+#
+# Use with the `gym-audit` skill. Each check is independently scorable.
+# Levels: absent (0.0) | partial (0.5) | present (1.0).
+# Category score = mean of level_scores across non-skipped checks.
+
+schema_version: 1
+
+scoring:
+  level_scores:
+    absent:  0.0
+    partial: 0.5
+    present: 1.0
+
+target_band:
+  description: "Per-task pass rate target under binary scoring"
+  baseline_example: "[1, 5] / 10"
+
+# What the auditor cares about universally:
+#   1. Is there a closed, typed universe of reward/check kinds?
+#   2. Does each kind have invariants (Pydantic + lint rules) that catch
+#      invalid structures at definition time, not runtime?
+#   3. Are golden solutions per task + golden-regression infra present?
+# These three are the load-bearing meta-questions.
+
+# ─────────────────────────────────────────────────────────────────────
+categories:
+
+  - id: environment_seeding
+    scope: environment
+    checks:
+      - id: declarative_seed_specs
+        principle: "One structured file per task describing initial state — not Python scripts or DB dumps."
+        detector:
+          method: classify_task_dir
+          steps:
+            - "list files under <task_dir>"
+            - "classify each: yaml/json/toml=declarative, .py with setup/seed func=imperative"
+        levels:
+          absent:  "all tasks are Python or SQL fixtures"
+          partial: "mix of declarative and imperative"
+          present: ">90% declarative"
+        baseline_example: "task_data/worlds/*.yaml"
+
+      - id: schema_validation
+        principle: "Malformed seeds fail at build time, not runtime."
+        detector:
+          method: locate_and_inject
+          steps:
+            - "grep for pydantic/jsonschema/typeddict in the seed loader"
+            - "inject a bad field into a copy and run build"
+            - "expect non-zero exit with typed error"
+        levels:
+          absent:  "no schema validation; runtime failures only"
+          partial: "validation exists but skips inner objects or has opaque errors"
+          present: "typed validator with field-level error messages at build"
+        baseline_example: "WorldState.model_validate (pydantic)"
+
+      - id: stable_id_substitution
+        principle: "Specs reference entities by author-chosen IDs; a substitution layer maps to runtime IDs before use."
+        detector:
+          method: grep_and_trace
+          steps:
+            - "grep for substitution syntax: $world${...}, {{...}}, @ref, <<...>>"
+            - "trace the substitution function — must walk the whole spec tree"
+        levels:
+          absent:  "tasks hardcode runtime IDs"
+          partial: "substitution only for one ID kind (UUID, no derived numbers)"
+          present: "entity refs + sequence/number refs + derived/next refs"
+        baseline_example: "substitute_world_ids in gym_github/world_builder.py"
+
+      - id: post_seed_snapshot
+        principle: "Snapshot captured after seeding enables 'what did the agent change?' diffs."
+        detector:
+          method: locate_schema
+          steps:
+            - "find a snapshot table/file (_state, _snapshot, baseline_*)"
+            - "confirm it stores row_ids AND per-row hashes, not just count+aggregate"
+        levels:
+          absent:  "freeze guards reconstruct expected state from spec"
+          partial: "aggregate snapshot only"
+          present: "per-row checksums + row IDs"
+        baseline_example: "_world_builder_state table with row_checksums"
+
+      - id: auto_mutated_field_exclusion
+        principle: "Denormalized counters / updated_at fields excluded from unchanged checks."
+        detector:
+          method: grep
+          steps:
+            - "grep for excluded-column lists (AUTO_UPDATED, EXCLUDED_COLUMNS, skip_columns)"
+        levels:
+          absent:  "no exclusion list"
+          partial: "exclusions exist but not documented"
+          present: "explicit per-table list applied at snapshot + verify time"
+        baseline_example: "_AUTO_UPDATED_COLUMNS in world_builder.py"
+
+      - id: external_services_materialized
+        principle: "Every dependency the task references (filesystems, services, repos) is seeded — not stubbed at runtime."
+        detector:
+          method: inspect_build
+          steps:
+            - "confirm build step populates all dependencies the runtime reads"
+        levels:
+          absent:  "runtime mocks fill in gaps"
+          partial: "main DB seeded but secondary stores stubbed"
+          present: "every dependency materialized"
+        baseline_example: "git-server tar materialized at startup"
+
+      - id: agent_permission_seeding
+        principle: "Agent's runtime identity gets the permissions it needs to act."
+        detector:
+          method: grep_builder
+          steps:
+            - "find permission/collaborator/role grants for the agent user during build"
+        levels:
+          absent:  "agent has to be granted permission at runtime by the task"
+          partial: "agent gets permission on some resources only"
+          present: "automatic grant on every resource the agent may need to mutate"
+        baseline_example: "agent auto-added as write collaborator on every repo"
+
+      - id: closed_entity_universe
+        principle: >
+          The kinds of entities a task can declare in its world are a CLOSED,
+          TYPED set. Adding a new entity kind requires a code change to the
+          schema, not just a YAML edit. This is what makes lint rules
+          tractable — you can enumerate every shape that needs validation.
+        detector:
+          method: locate_entity_schema
+          steps:
+            - "find the schema module declaring entity types (Pydantic, dataclass, JSONSchema)"
+            - "confirm it enumerates a closed set (not Dict[str, Any] or extensible-anything)"
+            - "spot-check: try a task with a fabricated entity-kind key and confirm build fails"
+        levels:
+          absent:  "world spec is Dict[str, Any]; any field accepted"
+          partial: "top-level entity classes are typed but inner fields are dicts"
+          present: "every entity kind has a typed model; unknown kinds fail at build"
+        baseline_example: "WorldState with Repo/User/Org/Issue/PR/Gist/Label/Wiki models"
+
+      - id: entity_invariants_declared
+        principle: >
+          Each entity type carries invariants (constraints, required fields,
+          cross-field rules) declared in the schema or enforced by lint
+          rules. The author of a task shouldn't be able to produce a
+          syntactically valid but semantically incoherent entity.
+        detector:
+          method: inspect_models_and_lint_rules
+          steps:
+            - "for each entity type, count constraint-bearing fields (Field(min_length=...), validators, @model_validator)"
+            - "cross-reference: does the lint corpus include rules that check inter-entity invariants? (e.g., reward references entity X → X must exist in world)"
+        levels:
+          absent:  "models are bag-of-fields; no constraints; no inter-entity checks"
+          partial: "some constraints in models OR some cross-entity lint rules"
+          present: "invariants declared in models AND cross-entity lint rules exist"
+        baseline_example: "model_validator + reward-linter rules like _check_label_seeding"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: procedural_generation
+    scope: environment
+    description: >
+      Coherence of the procedural generator that emits worlds + task variants:
+      every entity it seeds is reached by some goal/subgoal, every goal/subgoal
+      it emits resolves to a declared entity, the parameter space is bounded
+      and enumerable, and outputs are deterministic across runs.
+    checks:
+      - id: entity_to_goal_coverage
+        principle: >
+          Every entity the generator seeds into a world is referenced by at
+          least one reward (goal or subgoal) somewhere in the task corpus that
+          uses that world. Entities seeded but never read by any check are
+          dead state — noise that inflates the surface area an agent must
+          ignore and that drifts silently when underlying schemas change.
+        detector:
+          method: cross_reference_world_to_rewards
+          steps:
+            - "for each world spec, enumerate every declared entity ID/slot"
+            - "for each task using that world, enumerate every entity reference inside reward defs"
+            - "compute set-diff: entities present in world but absent from union of reward refs"
+            - "any entity in the diff is a candidate dead-seed"
+        levels:
+          absent:  "no audit of seeded-vs-referenced entities; dead state is common"
+          partial: "manual spot-checks; or coverage report exists but isn't enforced in CI/lint"
+          present: "automated reconciliation (lint rule or test) fails when a world seeds an unreferenced entity, with documented opt-out for shared baselines"
+        baseline_example: "TBD — reward-linter currently checks the reverse direction (refs → world); coverage direction is a known gap"
+        example_defect: "world seeds 12 issues but the task's reward set only inspects 3; the other 9 are silent fixtures that may rot"
+
+      - id: reward_to_entity_resolution_at_generator
+        principle: >
+          At the generator/template level (before per-task instantiation),
+          every entity reference inside a reward template resolves to a slot
+          the world template guarantees to fill. This is the meta-version of
+          the per-task `entity_references_resolve` check: it catches whole
+          variant families that would all fail in the same way, not just one
+          instance.
+        detector:
+          method: static_analyze_generator
+          steps:
+            - "locate generator/template code that emits reward defs"
+            - "extract entity-ref placeholders (e.g. $world${repo:X}, branch refs)"
+            - "cross-check against the world template's declared slots"
+            - "any placeholder with no matching slot is a generator-level dangling ref"
+        levels:
+          absent:  "resolution only happens at task instantiation; whole families can ship broken"
+          partial: "validation exists but only for one ref kind (entities, not numbers/derived refs)"
+          present: "generator refuses to emit when any placeholder is unresolvable across the world template"
+        baseline_example: "substitute_world_ids + reward-linter rules covering ref → entity invariants"
+        example_defect: "a reward template references $world${branch:feature_x} but the world template only declares main/dev — every emitted variant fails"
+
+      - id: subgoal_supports_goal
+        principle: >
+          Intermediate rewards (action rewards, mid-state assertions) must
+          contribute to reaching a terminal state. A subgoal that's not on
+          any path to a terminal goal is either dead scaffolding or a
+          mislabeled reward — both noise. The generator should refuse to
+          emit such combinations.
+        detector:
+          method: dependency_graph
+          steps:
+            - "build a DAG per task: action rewards → state rewards they enable"
+            - "mark terminal nodes (state assertions, answer checks)"
+            - "any non-terminal node with no path to a terminal is an orphan subgoal"
+            - "search the generator/template for emission rules that allow orphan subgoals"
+        levels:
+          absent:  "no notion of subgoal-vs-goal; rewards are flat unordered set"
+          partial: "convention exists (e.g. action rewards intended as scaffolding) but not enforced"
+          present: "generator validates that every action/intermediate reward is on a path to a terminal reward; otherwise emission fails"
+        baseline_example: "TBD — rewards currently flat; this is an aspirational structuring check"
+        example_defect: "an action reward `click(refresh)` is emitted alongside state checks that don't depend on the refresh — gives free credit for an irrelevant tool call"
+
+      - id: generator_parameter_space_enumerated
+        principle: >
+          The generator declares the parameter space it sweeps (axes, value
+          sets, variant count) up-front. An auditor can answer "this gym
+          generates N variants over axes [A, B, C]" from a manifest, not by
+          listing the filesystem. Implicit/discovered variant spaces are a
+          drift risk: variants get added by copy-paste and the actual
+          coverage diverges from any stated intent.
+        detector:
+          method: locate_generator_manifest
+          steps:
+            - "find a top-level generator config / manifest (yaml/py) declaring axes and value sets"
+            - "confirm the emitted task IDs are derivable from the manifest"
+            - "spot-check: rename one axis value, regenerate, confirm task ID set changes accordingly"
+        levels:
+          absent:  "variants are hand-authored copies with ad-hoc naming"
+          partial: "generator script exists but axes are inline; no manifest to audit at a glance"
+          present: "axes/values declared in a manifest; emitted IDs match a documented cartesian product (or explicit subset)"
+        baseline_example: "task_082_rel_rnd2_v2_tighten_branch_* variant family — declared axis = branch-tighten strategy"
+        example_defect: "a 30-variant family where two variants accidentally collide on the same parameter combination, silently overwriting"
+
+      - id: generator_determinism
+        principle: >
+          Given the same parameters + seed, the generator produces
+          byte-identical world specs and reward defs across runs. Flake
+          here is a major drift risk: identical task IDs can quietly drift
+          in content, breaking golden solutions and reward expectations.
+        detector:
+          method: run_twice_diff
+          steps:
+            - "run the generator end-to-end with fixed seed"
+            - "stash output A; run again into output B"
+            - "diff A and B; expect zero changes"
+            - "check for `random`/`uuid4`/`time.time` calls in generator code"
+        levels:
+          absent:  "uses uuid4/time without a seed; diffs every run"
+          partial: "mostly stable but timestamps or sort order vary"
+          present: "byte-identical output; explicit seed parameter; no non-seeded randomness"
+        baseline_example: "tasks_world.json regen produces stable output across runs"
+        example_defect: "world spec uses `datetime.now()` for created_at — every regen rewrites the file and golden solutions de-sync"
+
+      - id: cross_variant_entity_consistency
+        principle: >
+          When a generator emits multiple task variants over the same base
+          world, shared entities (same logical ID) have identical definitions
+          across variants. Variant V1 must not redefine `repo:alpha` with
+          different default branch than V2 if both share the world template,
+          since cross-variant linting and shared goldens depend on that
+          parity.
+        detector:
+          method: hash_shared_entities
+          steps:
+            - "group variants by their base world template"
+            - "within each group, hash every shared entity's full definition"
+            - "any entity with multiple distinct hashes across same-group variants is a drift"
+        levels:
+          absent:  "no notion of shared base; every variant fully self-contained"
+          partial: "shared base exists but variants override fields with no validation"
+          present: "shared entities frozen at the base; variants only add new entities or extend via documented override slots"
+        baseline_example: "task_082 family — all variants share the same upstream PR baseline"
+        example_defect: "variant V3 silently flips a label's color, breaking the lint rule that compares against the canonical color across variants"
+
+      - id: prompt_grounds_reward_entities
+        principle: >
+          The natural-language prompt references every entity the rewards
+          depend on (by name, ID, or unambiguous descriptor). A reward that
+          asserts on entity X without X appearing in the prompt asks the
+          agent to guess hidden state — undermines fair grading. The
+          generator should refuse to emit prompts that fail this grounding
+          check.
+        detector:
+          method: prompt_entity_intersection
+          steps:
+            - "extract the set of entity names/IDs referenced by all rewards in a task"
+            - "extract entity-like tokens from the prompt text"
+            - "for each reward-referenced entity, confirm a non-trivial mention in the prompt"
+            - "scan the generator for a pre-emit check that enforces this intersection"
+        levels:
+          absent:  "no relation enforced; prompts and rewards drift"
+          partial: "ad-hoc author discipline; no automated check"
+          present: "generator/lint rule fails emission when a reward-referenced entity has no prompt mention"
+        baseline_example: "TBD — currently relies on author discipline + QA review"
+        example_defect: "reward checks that PR #42 is merged but prompt only says 'merge the open PR' — ambiguous when multiple PRs are open"
+
+      - id: distractors_procedurally_generated
+        principle: >
+          Distractor entities (decoys, noise that makes the task non-trivial)
+          must be emitted by the same procedural generator that produces the
+          world + rewards — not hand-pasted per task. Hand-authored distractors
+          don't scale with variant count, tend to converge on identifiable
+          patterns the agent can exploit, and silently drift apart from the
+          world template they're supposed to camouflage among.
+        detector:
+          method: trace_distractor_origin
+          steps:
+            - "identify which entities qualify as distractors (e.g., entities in the world spec that no reward references)"
+            - "trace their origin in the generator: emitted by template (good) vs hardcoded block per task (bad)"
+            - "spot-check a variant family: confirm distractor identity AND count vary systematically across variants"
+            - "look for a `distractors:` or similar block in the world template, parameterized by the generator"
+        levels:
+          absent:  "no distractors, OR distractors are hand-authored per task (identical block across variants)"
+          partial: "some distractors generated (e.g., random user fillers) while topic-relevant distractors are still hand-pasted"
+          present: "distractors fully procedural: identity, count, and similarity-to-target driven by the generator with documented strategy"
+        baseline_example: "TBD — gym currently relies on shared baseline worlds; per-variant distractor generation is a gap"
+        example_defect: "20 variants of task_082 all carry the exact same 3 decoy PRs — a copy-pasted block that fails to vary with the target PR"
+
+      - id: solution_satisfies_all_rewards
+        principle: >
+          At generation time, the procedural system emits a solution (golden
+          trajectory or final-state snapshot) AND validates it against EVERY
+          reward in the task before allowing emission. A solution that passes
+          the answer reward but fails an intermediate state check is
+          broken-by-design — the task is unsolvable as graded. The generator
+          must refuse to emit such combinations rather than ship a half-broken
+          golden and let CI catch it (or not).
+        detector:
+          method: generator_invariant_check
+          steps:
+            - "locate the generator step that emits a (world, rewards, solution) bundle"
+            - "find a pre-emit validation hook that runs every reward against the emitted solution"
+            - "spot-check N random tasks: load the golden, evaluate every reward, expect all pass=true"
+            - "confirm a CI/regression layer rejects tasks where any reward fails on the bundled solution"
+        levels:
+          absent:  "solutions emitted without reward validation; broken goldens reach the corpus"
+          partial: "validation runs only at test time (regression suite) rather than at emission; broken goldens can sit in the tree until next CI"
+          present: "generator validates every reward kind against the emitted solution as a precondition for emission; failure aborts the task with a typed error"
+        baseline_example: "Partial — `golden_runner.py` runs goldens through rewards at test time, but emission-time validation isn't enforced"
+        example_defect: "a generated task ships with a golden that passes the final-state reward but fails an action reward, because the generator never ran the action reward against its own emitted trajectory"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: reward_compilers
+    scope: environment
+    checks:
+      - id: per_kind_modules
+        principle: "Compilers split by check family, not one monolithic file."
+        detector:
+          method: list_and_loc
+          steps:
+            - "list reward-compiler directory"
+            - "confirm 5+ focused modules, none >800 LOC"
+        levels:
+          absent:  "single file >1500 LOC"
+          partial: "2–3 files, mixed concerns"
+          present: "5+ modules, each focused"
+        baseline_example: "gym_github/reward_compiler/compilers/{issue,pr,wiki,file,state,guards,commit}.py"
+
+      - id: registry_pattern
+        principle: "Check-kind strings dispatch via decorator registration, not if/elif."
+        detector:
+          method: grep
+          steps:
+            - "grep for @register / REGISTRY[] / dispatch_table"
+        levels:
+          absent:  "if/elif in central compile()"
+          partial: "registry exists but some kinds still hardcoded"
+          present: "all kinds registered; adding kind = adding decorated function"
+        baseline_example: "@register decorator in gym_github/reward_compiler/registry.py"
+
+      - id: typed_check_models
+        principle: "Each check kind has a typed model with field constraints."
+        detector:
+          method: count_models
+          steps:
+            - "grep for class .*Model / @dataclass / TypedDict"
+            - "confirm one model per check kind"
+        levels:
+          absent:  "free-form dict[str, Any]"
+          partial: "some kinds modeled"
+          present: ">90% of kinds have a typed model"
+        baseline_example: "gym_github/reward_compiler/models.py (15+ models)"
+
+      - id: reusable_filter_primitives
+        principle: "Body/content/scope matching is shared, not reimplemented per compiler."
+        detector:
+          method: grep_helpers
+          steps:
+            - "find shared helpers (_body_conditions, _repo_condition, etc.)"
+            - "confirm used by 3+ compilers"
+        levels:
+          absent:  "each compiler reimplements LIKE/regex/case logic"
+          partial: "helpers exist but not consistently used"
+          present: "filter primitives in helpers.py, called by most compilers"
+        baseline_example: "gym_github/reward_compiler/helpers.py"
+
+      - id: closed_reward_compiler_universe
+        principle: >
+          The set of reward/check KINDS the framework supports is closed and
+          enumerable. New kinds require a code change (new compiler module +
+          registered model), not just a YAML edit. Task authors choose FROM
+          the universe; they don't invent kinds. This is what makes lint
+          rules tractable — you can ensure every kind has invariants.
+        detector:
+          method: enumerate_kinds
+          steps:
+            - "list the registry / dispatch table"
+            - "confirm it's a fixed Dict/Enum, not loaded from config"
+            - "spot-check: try a task with `check: nonsense_kind` and confirm build fails clearly"
+        levels:
+          absent:  "kinds are strings looked up in dynamic config; anything accepted"
+          partial: "closed set but no clear error for unknown kinds"
+          present: "closed enumerable set; unknown kinds fail with helpful error"
+        baseline_example: "@register dispatch table in reward_compiler"
+
+      - id: invariants_per_check_kind
+        principle: >
+          Every reward kind has invariants declared — via typed model fields,
+          cross-field validators, or paired lint rules — that catch invalid
+          structures at task-definition time. A task author writing a
+          malformed reward instance gets feedback BEFORE deployment.
+        detector:
+          method: per_kind_coverage_matrix
+          steps:
+            - "list every reward kind in the registry"
+            - "for each, locate its typed model (Pydantic class or equivalent)"
+            - "for each, list lint rules that target that kind"
+            - "compute coverage: kinds with model + ≥1 lint rule / total kinds"
+        levels:
+          absent:  "<30% of kinds have model + lint coverage"
+          partial: "30-70% covered"
+          present: ">70% covered; the missing kinds are documented as low-risk"
+        baseline_example: "models.py + task-designer/stages/reward_linter.py (~30 rules)"
+        note: "This is the load-bearing meta-check. If false, target gym cannot catch invalid reward structures regardless of how good its other infrastructure is."
+
+      - id: every_kind_smoke_compiled
+        principle: >
+          Every registered reward kind compiles end-to-end on at least one
+          representative task without raising. Catches drift where a new
+          field/option works in isolation but breaks when the full compile
+          pipeline runs over a real task.
+        detector:
+          method: smoke_compile_per_kind
+          steps:
+            - "enumerate every kind from the compiler's registry"
+            - "find (or synthesize) at least one task per kind that exercises it"
+            - "compile each task to its runtime form; expect no exceptions"
+            - "fail if ANY registered kind has zero representative tasks"
+        levels:
+          absent:  "no per-kind smoke; broken kinds discovered only when an agent runs into them"
+          partial: "smoke exists but some kinds have no representative task or are skipped"
+          present: "every registered kind has ≥1 representative compile-tested task, run via a documented smoke command"
+        baseline_example: "scripts/world_to_tasks_json.py over task_data/worlds/*.yaml exercises every kind used in the corpus"
+
+      - id: compiled_output_executes
+        principle: >
+          Compiled rewards produce predicates / SQL / matchers that actually
+          parse and execute against the snapshot DB schema (or equivalent
+          backing store). Catches the bug class where the compiler emits
+          syntactically-malformed SQL or references nonexistent columns —
+          which would otherwise only surface at grading time, per-task.
+        detector:
+          method: execute_compiled_predicates
+          steps:
+            - "build a representative world to populate the snapshot store"
+            - "for each reward in a sample of compiled tasks, EXPLAIN (or dry-run) the produced predicate"
+            - "fail on any parse error, missing column, or missing table"
+        levels:
+          absent:  "no end-to-end execution check; compiled output errors surface only on a live grade"
+          partial: "smoke executes for a few kinds; columns/tables not verified against the actual schema"
+          present: "every compiled predicate parses + executes against a fresh snapshot store without error"
+        baseline_example: "task-designer/stages/reward_linter.py uses SQLite EXPLAIN to validate SQL syntax — extending this to schema-level validation would satisfy this check"
+
+      - id: compiler_output_determinism
+        principle: >
+          Compiling the same task definition twice produces byte-identical
+          output. Catches the bug class where a refactor introduces non-
+          deterministic ordering (set iteration, dict-key order, randomized
+          UUIDs in compiled output, etc.) that silently changes grading
+          semantics across runs of the same task.
+        detector:
+          method: double_compile_diff
+          steps:
+            - "pick a corpus sample of representative tasks"
+            - "compile each task twice in fresh processes"
+            - "diff the two outputs byte-for-byte; fail on any difference"
+        levels:
+          absent:  "no determinism check; cross-run drift can creep in unnoticed"
+          partial: "smoke covers one or two compilers, not the full set"
+          present: "byte-identical output across compiles for every kind, verified by a repeatable smoke command"
+        baseline_example: "extend scripts/audit_reward_compiler.py with a double-compile diff over a sampled corpus"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: check_composition
+    scope: tasks
+    checks:
+      - id: paired_positive_negative
+        principle: "Every 'agent did X' positive has a paired 'no extra X' guard."
+        detector:
+          method: sample_and_ratio
+          steps:
+            - "sample 5 tasks"
+            - "count agent_did_* positives and no_extra_* guards"
+            - "expect ≥70% pairing ratio on action checks"
+        levels:
+          absent:  "<30% paired"
+          partial: "30-70%"
+          present: ">70%"
+        baseline_example: "no_extra_agent_issues with accounted_by"
+
+      - id: freeze_with_carveouts
+        principle: "Freeze guards can except entities the agent is legitimately allowed to mutate."
+        detector:
+          method: grep
+          steps:
+            - "grep for except:/allowlist:/carve_out: on freeze checks"
+        levels:
+          absent:  "freeze and mutate are incompatible"
+          partial: "carve-out for one resource type only"
+          present: "works on any frozen resource; runtime excludes from checksum"
+        baseline_example: "pre_existing_rows_unchanged with except: {table: [entity_ids]}"
+
+      - id: scope_qualifiers
+        principle: "Content checks accept scope qualifiers (branch, ref, snapshot, sub-tree)."
+        detector:
+          method: grep_field
+          steps:
+            - "find branch:/ref:/scope: field on content checks"
+            - "confirm the field actually changes the query"
+        levels:
+          absent:  "always runs against canonical state"
+          partial: "scope field accepted but partially honored"
+          present: "fully honored end-to-end"
+        baseline_example: "branch: field on file_content_replaced"
+
+      - id: scoring_mode_switch
+        principle: "Binary vs fractional grading is a single flag wired build → runtime."
+        detector:
+          method: trace_env_var
+          steps:
+            - "grep one flag across Makefile → build script → Dockerfile → runtime"
+        levels:
+          absent:  "hardcoded scoring mode"
+          partial: "runtime-only switch"
+          present: "single env var end-to-end"
+        baseline_example: "BINARY_SCORING build-arg → _reward_to_grade"
+
+      - id: mutual_exclusion_between_checks
+        principle: >
+          When two checks could be satisfied by the same agent artifact (e.g.,
+          two agent_created_issue rewards matching different anchors on the
+          same repo), the framework partitions them — one artifact counts
+          toward one reward, not many. Default-on; opting out is explicit per
+          check. Without this, a clever agent satisfies N rewards with one
+          well-crafted action.
+        detector:
+          method: inspect_dedup_semantics
+          steps:
+            - "find the field controlling exclusivity (e.g. `mutual_exclusion`)"
+            - "confirm compiled queries reference sibling checks (NOT IN clause, accounted-by exclusion, or equivalent) so each artifact lands in at most one bucket"
+            - "sample a task with multiple same-kind checks on the same scope; verify the artifacts are partitioned, not double-counted"
+        levels:
+          absent:  "no dedup; the same artifact can count for multiple checks (reward-hacking surface)"
+          partial: "dedup is opt-in only; the silent default allows double-counting"
+          present: "dedup is the default; explicit per-check opt-out (e.g. `mutual_exclusion: false`) is required to allow overlap"
+        baseline_example: "agent_created_issue defaults to mutual_exclusion-on; tasks opt out with `mutual_exclusion: false` only when two overlapping issues legitimately satisfy separate rewards"
+
+      - id: contradictory_rewards_detection
+        principle: >
+          Within a single task, no two rewards may be mutually unsatisfiable.
+          A task that requires both "issue X is closed" and "issue X remains
+          open" is unsolvable — every agent run scores 0 regardless of
+          action. The framework should detect such contradictions at compile
+          time, not at grade time.
+        detector:
+          method: detect_reward_contradictions
+          steps:
+            - "for each task, group rewards by the entity they target (`_on:` value)"
+            - "within each group, detect negation pairs: state=closed vs state=open; body_contains:X vs body_not_contains:X; agent_created_* vs agent_did_not_create_*; status assertions that disagree"
+            - "fail at compile time on any detected contradiction, with both reward names cited"
+        levels:
+          absent:  "no contradiction analysis; an unsolvable task can ship and every run scores 0 without explanation"
+          partial: "some specific contradictions caught (e.g., duplicate reward names, indistinguishable siblings) but the general negation-pair sweep is missing"
+          present: "compile-time analyzer enumerates entity-scoped reward pairs and flags any negation/state contradiction"
+        baseline_example: "_check_duplicate_reward_names + _check_indistinguishable_siblings (in reward_linter.py) catch structural duplicates; a semantic negation-pair detector would extend the family"
+
+      - id: writes_to_consistency
+        principle: >
+          The set of entities / tables the agent is expected to mutate (via
+          positive rewards: agent_created_*, file_content_replaced, branch_exists,
+          wiki_content_contains, etc.) must be consistent with what the freeze
+          guards permit. A reward requiring `file_content_replaced` on
+          `repo_x/file.py` while the same task freezes `repo_x` entirely
+          (without an `except:` carve-out) is unsolvable.
+        detector:
+          method: cross_validate_writes_vs_freezes
+          steps:
+            - "for each task, extract the set of entities / tables touched by positive rewards (the 'writes' set)"
+            - "extract the set of entities / tables under freeze guards minus their `except:` carve-outs (the 'frozen' set)"
+            - "fail at compile time on any positive-reward target that lies inside the frozen set without a matching carve-out"
+        levels:
+          absent:  "no consistency check; contradictions surface only at grade time"
+          partial: "specific freeze classes validated (e.g. nonexistent_guard_tables, state_unchanged tables exist) but the full writes-vs-frozen reconciliation is missing"
+          present: "compile-time linter cross-validates: every positive-reward target either lies outside the freeze set or has a matching `except:` carve-out"
+        baseline_example: "_check_nonexistent_guard_tables + pre_existing_rows_unchanged.except: cover parts of this; extending to a per-task writes-vs-frozen reconciliation would close the gap"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: task_design_discovery
+    scope: tasks
+    checks:
+      - id: in_world_conventions
+        principle: "Rules live in seeded artifacts, not the prompt."
+        detector:
+          method: prompt_audit
+          steps:
+            - "sample 5 hard task prompts"
+            - "word-count each (target <150 words)"
+            - "confirm seeded artifacts (docs/configs/comments) carry the rules"
+        levels:
+          absent:  "prompts enumerate every convention"
+          partial: "some conventions in prompt, others in artifacts"
+          present: "prompt is a vague nudge; conventions findable but not stated"
+
+      - id: distractor_density
+        principle: "Each task has enough distractors that pattern-matching alone fails."
+        detector:
+          method: count_distractor_entities
+          steps:
+            - "sample 5 hard tasks"
+            - "grep for entity IDs with _distractor/_wrong/_misfile/_decoy/_legacy"
+            - "threshold: ≥3 distractors per target on hard tasks"
+        levels:
+          absent:  "no identifiable distractors"
+          partial: "1-2 distractors per task"
+          present: "≥3 per target with corrective context"
+
+      - id: ordering_traps
+        principle: "Some tasks include reverse-order checklists to penalize naive sequencing."
+        detector:
+          method: grep_commentary
+          steps:
+            - "grep for 'ordering trap' / 'reverse' / 'reverse-dependency' in design notes"
+        levels:
+          absent:  "all checklists in correct order"
+          partial: "mentioned in commentary but not in seeded data"
+          present: "trap in seeded data AND flagged in commentary"
+
+      - id: scope_declaration
+        principle: "Hard tasks declare in-scope vs out-of-scope entities in design commentary."
+        detector:
+          method: read_commentary
+          steps:
+            - "parse commentary for 'in scope' / 'out of scope' sections"
+        levels:
+          absent:  "scope only inferable from rewards"
+          partial: "mentioned in prose, not enumerated"
+          present: "both in-scope and out-of-scope entities listed"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: self_documentation
+    scope: tasks
+    checks:
+      - id: design_commentary
+        principle: "Every task file has a top-level design rationale section."
+        detector:
+          method: presence_check
+          steps:
+            - "every task file should have task_design_commentary (or equivalent)"
+        levels:
+          absent:  "<20% have commentary"
+          partial: "20-80% coverage"
+          present: ">80% have commentary, consistent shape"
+
+      - id: per_reward_evidence
+        principle: "Each reward has structured pointers to what supports it in the world."
+        detector:
+          method: sample
+          steps:
+            - "sample 3 tasks"
+            - "confirm rewards have evidence:/sources: array with typed entries"
+        levels:
+          absent:  "no evidence pointers"
+          partial: "free-form prose evidence"
+          present: "typed evidence entries {type, entity, description}"
+
+      - id: inline_calibration_comments
+        principle: "Adjusted anchors carry a comment explaining the change."
+        detector:
+          method: grep
+          steps:
+            - "grep for 'CALIBRATION' / 'QA fix' / 'Round N' / 'softened' / 'tightened'"
+        levels:
+          absent:  "no annotations on calibrated tasks"
+          partial: "some comments, inconsistent"
+          present: "every recalibrated anchor has a why-comment"
+
+      - id: published_coverage
+        principle: "Deployment metadata exposes reward count + named reward list per problem."
+        detector:
+          method: inspect_metadata
+          steps:
+            - "find generated metadata file"
+            - "confirm reward_count and covered_rewards fields"
+        levels:
+          absent:  "metadata is id+image only"
+          partial: "reward count only"
+          present: "count + named list"
+        baseline_example: "problems-metadata.json"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: calibration_discipline
+    scope: tasks
+    checks:
+      - id: intent_in_filenames
+        principle: "Calibration variants name their lever (drop/relax/tighten/combo/round-N)."
+        detector:
+          method: filename_classify
+          steps:
+            - "list calibrated variants"
+            - "ratio matching /(drop|relax|tighten|combo|round|breadcrumb)_/ vs /_v\\d+$/"
+        levels:
+          absent:  "variants are _v2, _v3, etc."
+          partial: "some descriptive, some opaque"
+          present: ">70% describe the lever"
+
+      - id: baseline_preserved
+        principle: "Original uncalibrated task kept alongside variants."
+        detector:
+          method: pairing_check
+          steps:
+            - "for each calibrated family, confirm a non-suffixed base file exists"
+        levels:
+          absent:  "base overwritten by latest"
+          partial: "some families preserve baseline"
+          present: "every family has a baseline"
+
+      - id: target_band_documented
+        principle: "The calibration target is written down."
+        detector:
+          method: grep
+          steps:
+            - "grep README / docs / rubric for 'target band' / 'pass rate' / 'calibration target'"
+        levels:
+          absent:  "no documented target"
+          partial: "mentioned in commit messages only"
+          present: "stated in README/docs"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: validation_infrastructure
+    scope: environment
+    checks:
+      - id: validate_target
+        principle: "A `make validate-*` target schema-validates all task specs."
+        detector:
+          method: run
+          steps:
+            - "grep Makefile for validate-* target"
+            - "run on clean tree, expect exit 0"
+        levels:
+          absent:  "no such target"
+          partial: "exists but skips errors"
+          present: "runs full validation, non-zero on failure"
+
+      - id: filterable_batch
+        principle: "Subset compile possible — broken specs don't block validating others."
+        detector:
+          method: cli_inspect
+          steps:
+            - "confirm --task-ids / --filter / --ids flag"
+        levels:
+          absent:  "all-or-nothing batch only"
+          partial: "exact-match filter"
+          present: "substring/glob filter"
+
+      - id: unresolved_substitution_logging
+        principle: "Partial substitution failures log unresolved refs at setup."
+        detector:
+          method: grep
+          steps:
+            - "grep for 'unresolved' / 'missing.ref' in setup code"
+        levels:
+          absent:  "silent leftover placeholders"
+          partial: "debug-only logging"
+          present: "info-level logging of unresolved refs"
+
+      - id: entity_references_resolve
+        principle: >
+          Every entity ID referenced from a check (`_on:`, `entity:`, fields
+          inside `accounted_by`, $world${id} substitutions, etc.) must resolve
+          to an entity declared in the same task's world section. Catches
+          typos, stale references, and drift between rewards and seeded data
+          at build time, not at grading time.
+        detector:
+          method: cross_validate_entity_refs
+          steps:
+            - "for each task, collect the set of declared entity IDs from the world section"
+            - "scan the rewards for every entity reference: `_on`, `entity:`, `$world${...}`, `accounted_by` names"
+            - "flag every reference that doesn't resolve to a declared entity"
+        levels:
+          absent:  "no cross-validation; dangling refs surface only at grade time (or silently produce empty queries)"
+          partial: "validators exist for specific entity types (labels, wikis, tables) but not exhaustive across all reference points"
+          present: "every entity reference is cross-validated at build time; build fails on any unresolved ref"
+        baseline_example: "_check_label_seeding, _check_wiki_reward_seeding, _check_nonexistent_guard_tables in task-designer/stages/reward_linter.py cover labels/wikis/tables — a comprehensive sweep would extend to repos, issues, PRs, users, gists"
+
+      - id: cross_reference_validation
+        principle: "Guards that reference positive checks by name fail at compile if name is wrong."
+        detector:
+          method: inject_typo
+          steps:
+            - "copy a task; rename a positive reward but leave guard pointing at old name"
+            - "expect ValueError with location info"
+        levels:
+          absent:  "silent skip; guard fires at grade with confusing error"
+          partial: "compile error but no location"
+          present: "clear error naming the unknown reference"
+        baseline_example: "_auto_populate_accounted_by"
+
+      - id: golden_solution_per_task
+        principle: >
+          Every task has a stored golden solution — a known-good trajectory,
+          action sequence, or final-state snapshot proving the task is
+          actually solvable and the reward set fully passes for it. Tasks
+          without a golden are unverified theory.
+        detector:
+          method: presence_coverage
+          steps:
+            - "find golden directory (golden/, solutions/, expected/, fixtures/golden/)"
+            - "compute coverage: tasks with a golden file / total tasks"
+        levels:
+          absent:  "no golden infrastructure OR <30% coverage"
+          partial: "30-90% coverage"
+          present: ">90% of tasks have a golden solution"
+
+      - id: golden_solution_regression_test
+        principle: >
+          A CI-runnable test verifies all goldens still pass after changes
+          to world builder, reward compiler, or linter. Catches the bug
+          class where infrastructure changes silently break grading.
+        detector:
+          method: locate_and_run
+          steps:
+            - "find a script/test that replays goldens against the current grader"
+            - "run on the current tree; expect every golden to score 1.0"
+        levels:
+          absent:  "no regression infra; goldens are static files no one runs"
+          partial: "regression script exists but not in CI"
+          present: "regression runs in CI; broken goldens block merge"
+        baseline_status: partial
+        note: "Baseline has goldens but no automated regression."
+
+      - id: golden_solution_format
+        principle: >
+          Goldens are structured and machine-comparable (JSON trajectory,
+          DB-state snapshot, or replayable action log) — not free-form
+          notes that a human has to interpret.
+        detector:
+          method: inspect_golden_format
+          steps:
+            - "sample 3 golden files; confirm structured format with discriminator fields"
+        levels:
+          absent:  "goldens are markdown notes"
+          partial: "structured but inconsistent across tasks"
+          present: "single typed format; loadable by the regression script"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: linters
+    scope: environment
+    description: "Static analyzers catching problematic reward configs before runtime."
+    rule_checks:
+      - id: unknown_compiler_keys
+        principle: "Typoed field names on rewards (body_contians) flagged at lint."
+        baseline_rule: "_check_unknown_compiler_keys"
+
+      - id: duplicate_reward_names
+        principle: "Reward names unique so accounted_by isn't ambiguous."
+        baseline_rule: "_check_duplicate_reward_names"
+
+      - id: indistinguishable_sibling_rewards
+        principle: "Two rewards with identical predicates flagged as likely copy-paste."
+        baseline_rule: "_check_indistinguishable_siblings"
+
+      - id: weak_body_anchors
+        principle: "Substring anchors below length threshold or matching common words flagged."
+        baseline_rule: "_check_weak_body_anchors"
+        example_defect: "body_contains: ['refs #'] — 7 chars, matches 'prefs #1'"
+
+      - id: name_assertion_polarity
+        principle: "Positive name with negative assertion (or vice versa) flagged."
+        baseline_rule: "_check_name_assertion_polarity"
+
+      - id: numeric_match_path
+        principle: "NUMERIC_MATCH operator requires a numeric path."
+        baseline_rule: "_check_numeric_match_needs_path"
+
+      - id: assertion_key_validity
+        principle: "Assertion keys match the model."
+        baseline_rule: "_check_assertion_keys"
+
+      - id: missing_positive_for_guard
+        principle: "Guards without a positive counterpart flagged."
+        baseline_rule: "_check_missing_positive_content"
+
+      - id: nonexistent_guard_tables
+        principle: "tables: list on freeze guards must reference real tables."
+        baseline_rule: "_check_nonexistent_guard_tables"
+
+      - id: label_seeding
+        principle: "Labels referenced by rewards must be seeded."
+        baseline_rule: "_check_label_seeding"
+
+      - id: wiki_reward_seeding
+        principle: "Wiki/doc artifacts referenced by rewards must exist as seeded."
+        baseline_rule: "_check_wiki_reward_seeding"
+
+      - id: wiki_slug_mismatch
+        principle: "Slug used in content checks matches a seeded artifact slug."
+        baseline_rule: "_check_wiki_reward_slug_mismatch"
+
+      - id: leaked_annotations
+        principle: "Author notes (TODO/REVIEWME/SOLUTION) don't appear in agent-visible seeded text."
+        baseline_rule: "_check_leaked_annotations"
+
+      - id: surviving_placeholders
+        principle: "Templating placeholders don't survive into agent-visible text."
+        baseline_rule: "_check_surviving_placeholders"
+
+      - id: answer_hints_in_seeded_text
+        principle: "Seeded text doesn't trivially leak the solution."
+        baseline_rule: "_check_answer_hints"
+
+      - id: world_template_in_agent_fields
+        principle: "Substitution placeholders ($world${...}) don't leak into prompts."
+        baseline_rule: "_check_world_template_in_agent_fields"
+
+      - id: double_interpolation
+        principle: "Nested substitution markers flagged."
+        baseline_rule: "_check_double_interpolation"
+
+      - id: thin_source_files
+        principle: "Implausibly thin seeded source files flagged."
+        baseline_rule: "_check_thin_source_files"
+
+      - id: leading_slash_paths
+        principle: "Absolute paths flagged where relative was meant."
+        baseline_rule: "_check_leading_slash_paths"
+
+      - id: url_namespace_consistency
+        principle: "Resource URL namespace matches platform routing."
+        baseline_rule: "_check_url_namespace"
+
+      - id: image_urls_format
+        principle: "Image references use the seeded format."
+        baseline_rule: "_check_image_urls"
+
+      - id: wiki_image_conflicts
+        principle: "Same image referenced from multiple pages flagged."
+        baseline_rule: "_check_wiki_image_conflicts"
+
+      - id: slug_special_chars
+        principle: "Slugs don't contain URL-breaking characters."
+        baseline_rule: "_check_wiki_slug_special_chars"
+
+      - id: link_slugs_resolve
+        principle: "Markdown links to slugs resolve to seeded artifacts."
+        baseline_rule: "_check_wiki_link_slugs"
+
+      - id: coverage_manifest_consistency
+        principle: "covered_rewards manifest matches actual reward set."
+        baseline_rule: "_check_coverage_manifest"
+
+      - id: state_unchanged_completeness
+        principle: "state_unchanged guards cover tables agent can mutate."
+        baseline_rule: "_check_state_unchanged"
+
+      - id: timestamp_guard
+        principle: "SQL doesn't compare to fixed timestamps that the world doesn't reproduce."
+        baseline_rule: "_check_timestamp_guard"
+
+    infrastructure_checks:
+      - id: lint_cli_with_severity
+        principle: "Lint runs as one CLI, exit non-zero on findings, severity filtering."
+        detector:
+          method: cli_inspect
+          steps:
+            - "find lint script"
+            - "confirm --min-severity flag and non-zero exit semantics"
+        levels:
+          absent:  "no lint CLI"
+          partial: "exists but always exits 0"
+          present: "severity-bucketed, exits non-zero appropriately"
+        baseline_example: "scripts/lint_tasks.py --min-severity high"
+
+      - id: compiler_ast_audit
+        principle: "AST-level audit catches silent field drops in the compiler itself."
+        detector:
+          method: locate
+          steps:
+            - "find audit_*compiler*.py or equivalent"
+        levels:
+          absent:  "no AST audit"
+          partial: "manual review only"
+          present: "automated AST audit script"
+        baseline_example: "scripts/audit_reward_compiler.py"
+
+      - id: systematic_fixers
+        principle: "Common defect classes have batch-fix scripts."
+        detector:
+          method: locate
+          steps:
+            - "find fix_*.py / repair_*.py family"
+        levels:
+          absent:  "no fixers"
+          partial: "one ad-hoc script"
+          present: "≥3 systematic fixers"
+        baseline_example: "scripts/fix_duplicate_reward_names.py, fix_audit_findings.py"
+
+      - id: rule_fixture_testing
+        principle: "Each lint rule has bad+ok fixtures and a unit test."
+        detector:
+          method: list_fixtures
+          steps:
+            - "find linter/fixtures or tests dir"
+            - "confirm rule_id_bad.yaml + rule_id_ok.yaml per rule"
+            - "confirm pytest exists asserting both"
+        levels:
+          absent:  "rules have no fixtures"
+          partial: "some rules have fixtures"
+          present: "every rule has bad+ok fixtures + assertions"
+        baseline_status: absent
+        note: "Baseline rules don't have fixture pairs."
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: deployment_pipeline
+    scope: environment
+    checks:
+      - id: release_target
+        principle: "Single command takes clean tree → deployed image."
+        detector:
+          method: inspect_makefile
+          steps:
+            - "find release target that runs generate-metadata + build + push"
+        levels:
+          absent:  "multi-step manual process"
+          partial: "target exists but misses one step"
+          present: "single target does full cycle"
+        baseline_example: "make release-world"
+
+      - id: env_threading
+        principle: "Build-time env vars are threaded to runtime config via build args."
+        detector:
+          method: trace_chain
+          steps:
+            - "pick one build-time flag"
+            - "trace Makefile → build script → Dockerfile → runtime config"
+        levels:
+          absent:  "build flags don't reach runtime"
+          partial: "one known flag works, others don't"
+          present: "pattern documented, new flags follow it"
+        baseline_example: "BINARY_SCORING threaded end-to-end"
+
+      - id: reproducible_tags
+        principle: "Image tags encode time or commit; old tags pullable."
+        detector:
+          method: inspect_tag_format
+        levels:
+          absent:  "always 'latest'"
+          partial: "v1/v2 monotonic"
+          present: "timestamp or SHA, all preserved"
+        baseline_example: "tga-cu_world_v001_pat:YYYYMMDD-HHMMSS"
+
+      - id: last_deployed_tag_persisted
+        principle: "Build writes the deployed tag to a file; push reads from it."
+        detector:
+          method: locate
+          steps:
+            - "find .image-tag / .problem-image / .last-build"
+        levels:
+          absent:  "tag lives only in build logs"
+          partial: "written but not read by push"
+          present: "written by build, read by push"
+        baseline_example: "taiga/.problem-image"
+
+      - id: subset_metadata
+        principle: "Partial reruns supported via subset metadata generation."
+        detector:
+          method: locate_script
+          steps:
+            - "find subset_*/filter_*/partial-* script accepting an ID list"
+        levels:
+          absent:  "full metadata only"
+          partial: "manual jq workaround"
+          present: "first-class subset CLI"
+        baseline_example: "taiga/scripts/subset_problems.py"
+
+      - id: coverage_in_metadata
+        principle: "Deployment manifest carries per-problem reward count + named reward list."
+        detector:
+          method: inspect_metadata
+        levels:
+          absent:  "metadata is id+image only"
+          partial: "count only"
+          present: "count + named list per problem"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: qa_observability
+    scope: environment
+    checks:
+      - id: structured_grading_output
+        principle: "Per-attempt output lists failing checks by name."
+        detector:
+          method: sample_output
+          steps:
+            - "run one task with known-failing agent"
+            - "confirm passed/total/failing[] fields"
+        levels:
+          absent:  "single pass/fail bit"
+          partial: "score+total, no names"
+          present: "full named-reward breakdown"
+
+      - id: trajectory_analyzer
+        principle: "Tooling to inspect/replay an attempt's actions."
+        detector:
+          method: locate
+          steps:
+            - "find analyze_trajectory* / replay_* / inspect_run*"
+        levels:
+          absent:  "operators read raw logs"
+          partial: "ad-hoc script"
+          present: "polished CLI"
+
+      - id: external_qa_loop
+        principle: "Bidirectional loop with grading service (fetch findings + push decisions)."
+        detector:
+          method: locate
+          steps:
+            - "find qa_review / qa_feedback CLI"
+        levels:
+          absent:  "QA out-of-band"
+          partial: "one-way fetch"
+          present: "bidirectional CLI"
+        baseline_example: "taiga/scripts/taiga_qa_review.py"
+
+      - id: calibration_batch_tools
+        principle: "Scripts to apply systematic adjustments across N tasks."
+        detector:
+          method: locate
+          steps:
+            - "find calibrate_*/calib_* scripts"
+        levels:
+          absent:  "no batch tools"
+          partial: "one ad-hoc"
+          present: "documented family"
+
+      - id: failure_pattern_aggregation
+        principle: "Failure breakdown across N attempts is queryable."
+        detector:
+          method: confirm
+          steps:
+            - "given a grading output file, can you compute 'most-failed reward' with one jq?"
+        levels:
+          absent:  "requires custom code"
+          partial: "with custom jq"
+          present: "first-class aggregator"
+
+  # ─────────────────────────────────────────────────────────────────
+  - id: runtime_correctness
+    scope: environment
+    checks:
+      - id: snapshot_based_freeze
+        principle: "Unchanged checks compare against captured snapshot, not re-derived state."
+        detector:
+          method: read_implementation
+          steps:
+            - "find freeze-check implementation"
+            - "confirm reads from snapshot table, not re-evaluates spec"
+        levels:
+          absent:  "re-derives every grade"
+          partial: "mix of snapshot + derived"
+          present: "snapshot is single source of truth"
+
+      - id: per_entity_checksum
+        principle: "Per-row hashes enable carve-outs."
+        detector:
+          method: inspect_schema
+          steps:
+            - "confirm row_ids AND row_checksums columns"
+        levels:
+          absent:  "aggregate only"
+          partial: "row IDs but no per-row hash"
+          present: "both; carve-outs verified at runtime"
+
+      - id: resilient_substitution
+        principle: "Unresolved refs log + leave token in place; don't crash."
+        detector:
+          method: inject_unresolved
+          steps:
+            - "add a $world${nonexistent} ref to a copy"
+            - "expect build completes + log line"
+        levels:
+          absent:  "crashes"
+          partial: "completes silently"
+          present: "completes + logs unresolved set"
+
+      - id: faithful_app_mock
+        principle: "Seeded state mirrors live-app behavior for derived/denormalized fields."
+        detector:
+          method: e2e_diff
+          steps:
+            - "pick one denorm field"
+            - "perform action in real app vs seeded env"
+            - "expect identical final state"
+        levels:
+          absent:  "drift across multiple fields"
+          partial: "approximates with known gaps"
+          present: "no drift across sampled actions"
+
+      - id: counter_separation
+        principle: "Independent number sequences for different entity classes (matches app behavior)."
+        detector:
+          method: grep
+          steps:
+            - "find counter logic; confirm separate state for each class"
+        levels:
+          absent:  "single shared counter"
+          partial: "split but with bugs (pinning collisions)"
+          present: "separate counters with pin-skip logic"
+
+# ─────────────────────────────────────────────────────────────────────
+# Cross-cutting (apply across all categories)
+cross_cutting:
+
+  - id: round_trip_parity
+    principle: "Sampled tasks compile, seed, grade, tear down with 0 errors."
+    detector:
+      method: e2e_sample
+      steps:
+        - "sample 10 random tasks"
+        - "for each: build → seed → run dummy agent → grade → teardown"
+        - "report any task failing any phase"
+
+  - id: calibration_vocabulary
+    principle: "Filenames describe levers, not opaque versions."
+    detector:
+      method: filename_audit
+      steps:
+        - "list all task variants"
+        - "classify intent-described vs opaque"
+        - "threshold: >60% intent-described"
+
+
+# Load-bearing meta-questions — if these fail, lower-level findings matter less.
+# An auditor producing a top-line judgment should weight these heavily.
+load_bearing_meta_checks:
+  description: >
+    The three structural questions that determine whether the gym can
+    catch invalid reward configurations in principle. If any of these
+    are absent, the audit's headline should reflect that even if many
+    smaller checks pass.
+  ids:
+    - environment_seeding.closed_entity_universe
+    - reward_compilers.closed_reward_compiler_universe
+    - reward_compilers.invariants_per_check_kind
+    - validation_infrastructure.golden_solution_per_task

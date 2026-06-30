@@ -1,0 +1,1889 @@
+schema_version: 1
+source_doc: docs/world_generation_lifecycle.md
+phases:
+- name: Phase 1 — Skeleton (procedural)
+  id: phase_1_skeleton_procedural
+  corpus: draft
+  corpus_path: task-designer/drafts/
+  stages:
+  - name: Stage 1 — Objective
+    id: stage_1_objective
+    summary: Picks the task type (1–N) from `tables/goal_decompositions.yaml` or accepts a grounded one.
+    files:
+    - stages/s01_objective.py
+    - tables/goal_decompositions.yaml`.
+    checks:
+    - id: exists_in_closed_set
+      scope: per-task
+      what: '`task_type_id` exists in `tables/goal_decompositions.yaml` (closed set).'
+      why: An unrecognized `task_type_id` means downstream stages have no decomposition rows to expand against, so subgoal/edge-pattern
+        lookups silently fall back to empty lists and the entire task corpus skeleton collapses.
+      suggestion: Validate `task_type_id` against the loaded `tables/goal_decompositions.yaml` key set at the top of stage
+        1 and hard-fail with the offending value.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 1 (Objective). It reads the `task_type_id` field that Stage
+        1 writes to `task-designer/drafts/<task>/stage_01.json` and verifies that ID exists as a row in `tables/goal_decompositions.yaml`.
+        A task lands here when it was authored from an opt-in grounding file under `task-designer/grounding/<name>.yaml` that
+        supplies its own objective directly, bypassing the closed-set lookup entirely — there is no `task_type_id` for the
+        check to validate.
+      code: S1C1
+      script: audit/scripts/s01_objective.py::exists_in_closed_set
+    - id: 20_chars_and_names_at_least_one_concrete_entity_kind
+      scope: per-task
+      what: '`description` ≥ 20 chars and names at least one concrete entity kind from the gym''s schema.'
+      why: A vague objective (e.g. "do the thing") can't be matched to a concrete entity kind by stage 2's goal expansion,
+        producing goals that point at nothing the gym can render or grade.
+      suggestion: Add a regex/entity-kind sniff on `description` against the gym's schema enum and reject objectives that
+        don't name at least one entity.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 1 (Objective). It reads the `description` string in `stage_01.json`
+        and enforces a length + entity-kind floor. A task lands here when its objective is inherited verbatim from a grounding
+        file (opt-in input under `task-designer/grounding/`) and never re-emitted by Stage 1, so there is no Stage-1-authored
+        description for the rubric to measure.
+      code: S1C2
+      script: audit/scripts/s01_objective.py::description_floor_and_entity_kind
+    - id: when_grounded_the_grounding_file_s_matches_stage
+      scope: per-task
+      what: When grounded, the grounding file's `objective.task_type_id` matches stage output exactly.
+      why: Drift between grounding's `task_type_id` and the stage output means downstream stages run a different decomposition
+        than the grounding promised, breaking goldens that assume the grounded type.
+      suggestion: When grounded, short-circuit stage 1 to copy `objective.task_type_id` verbatim from the grounding file and
+        assert equality before returning.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 1 (Objective). It cross-references `task-designer/grounding/<name>.yaml`'s
+        `objective.task_type_id` against `stage_01.json`'s emitted value. A task lands here when it was generated purely procedurally
+        with no grounding file at all (grounding is an opt-in input) — there is nothing to cross-reference.
+      code: S1C3
+    - id: stage_is_deterministic_running_twice_with_the_same
+      scope: per-stage
+      what: 'Stage is deterministic: running twice with the same inputs produces identical output.'
+      why: 'Non-determinism here cascades: every later stage seeded from this output produces a different DAG/reward set per
+        run, making regeneration drift goldens and breaking reproducibility of evidence pointers.'
+      suggestion: Make all randomness in stage 1 derive from the explicit `seed` (no `time.time()`, no unsorted dict iteration)
+        and add a self-diff test that runs the stage twice.
+      code: S1C4
+      script: audit/scripts/s01_objective.py::stage_is_deterministic_running_twice
+    code: S1
+  - name: Stage 2 — Goals
+    id: stage_2_goals
+    summary: 'Expands the objective into a goal list. Enforces the **UI-required** invariant: at least one goal must require
+      browser interaction.'
+    files:
+    - stages/s02_goals.py
+    - models/goals.py`.
+    checks:
+    - id: task_emits_at_least_one_goal
+      scope: per-task
+      what: Stage 2 emits at least one goal — the task has something to decompose into subgoals/edges/rewards downstream.
+      why: A task with zero goals starves stages 3–6 — no subgoals, no DAG, no action matrix, no rewards. The grader has nothing
+        to evaluate, so the task is unscorable by construction. This is the floor that the goal_count_band and UI-required
+        checks rely on being true.
+      suggestion: Assert `len(stage_02.json['goals']) >= 1` at stage 2 exit; reject the task with the offending row in `tables/goal_decompositions.yaml`.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It opens `task-designer/drafts/<task>/stage_02.json`
+        and reads the `goal_graph.goals[]` list. A task lands here when no draft Stage 2 artifact exists for it — most commonly
+        because the task is a SHIPPED world under `task-designer/worlds/` (already past Stage 2, its draft folder may have
+        been cleaned up), or because the audit recorded the same draft under a different ID label (e.g. `003` vs `task_003`)
+        and the dedup didn't merge them. Tasks that genuinely reached Stage 2 and emitted zero goals would appear as FAIL,
+        not N/A.
+      code: S2C1
+      script: audit/scripts/floor_checks.py::task_emits_at_least_one_goal
+    - id: all_goal_ids_are_unique_within_the_task
+      scope: per-task
+      what: All goal IDs are unique within the task.
+      why: Duplicate goal IDs cause stage 3's `parent_id` lookups and stage 4's edges to bind to the wrong goal, silently
+        merging two semantically distinct goals into one grader target.
+      suggestion: Collect goal IDs into a set as they're emitted in stage 2 and raise on first collision, namespacing IDs
+        by `task_id` if needed.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It reads the `goals[].id` values in `stage_02.json`
+        and confirms no two are equal. A task lands here when Stage 2 emitted zero or one goal, making uniqueness structurally
+        vacuous (no pair exists to collide).
+      code: S2C2
+      script: audit/scripts/s02_goals.py::all_goal_ids_are_unique_within_the_task
+    - id: goal_count_is_within_band
+      scope: per-task
+      what: Goal count is within `config.structure.goal_count` band.
+      why: 'Out-of-band goal counts break the difficulty contract: too few yields trivial tasks that pass without exploration,
+        too many produce unsolvable timeouts and skew the pass-rate target.'
+      suggestion: Clamp/reject goal counts against `config.structure.goal_count` immediately after expansion and log which
+        decomposition row caused the drift.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It compares `len(stage_02.goals)` against the
+        `config.structure.goal_count` band declared in the task's config. A task lands here when its config omits a `structure.goal_count`
+        band — goal counts are then open-ended by design and no band exists to enforce.
+      code: S2C3
+      script: audit/scripts/s02_goals.py::goal_count_is_within_band
+    - id: every_is_a_member_of_the_closed_enum
+      scope: per-task
+      what: Every `Goal.type` is a member of the closed `GoalType` enum.
+      why: An unknown `Goal.type` means later stages (action matrix, reward declarations) have no handler, so the goal is
+        silently skipped and its rewards never compile — agent gets free credit or grader is empty.
+      suggestion: Validate `Goal.type` against the `GoalType` enum at stage 2 exit; reject the task rather than the goal so
+        the bad decomposition is fixed.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It reads each `goals[].type` field in `stage_02.json`
+        and validates it against the closed `GoalType` enum in `models/goals.py`. A task lands here when it uses a schema
+        variant where goals are untyped (no `type` field emitted), so there is nothing to enum-check.
+      code: S2C4
+      script: audit/scripts/s02_goals.py::every_goal_type_in_closed_enum
+    - id: at_least_one_goal_is_ui_required_matches_the_same
+      scope: per-task
+      what: At least one goal is UI-required (matches the same predicate `_ensure_ui_required()` uses).
+      why: Without a UI-required goal, the task is solvable purely via API/CLI and the browser-CUA premise is broken — the
+        gym is no longer testing what it claims to test.
+      suggestion: Call the same `_ensure_ui_required()` predicate used at runtime as a post-stage-2 assertion; do not paraphrase
+        its logic.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It re-runs the same `_ensure_ui_required()` predicate
+        Stage 2 uses against `stage_02.json` to confirm at least one goal requires browser interaction. A task lands here
+        when its config explicitly marks it as headless or CLI-only, disabling the UI-required invariant by design.
+      code: S2C5
+    - id: every_goal_references_at_least_one_entity_kind
+      scope: per-task
+      what: Every goal references at least one entity kind declared in the gym's closed world schema.
+      why: Goals that don't name a schema entity can't be hydrated to concrete world objects, so stage 5's action matrix has
+        nothing to bind verbs to and the goal becomes ungradable.
+      suggestion: Cross-check each goal's referenced kinds against the gym's closed-world schema enum and fail-fast at stage
+        2 exit.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It walks each goal in `stage_02.json` and confirms
+        it binds to at least one entity kind declared in the gym's closed-world schema. A task lands here when its goals are
+        pure-reasoning (e.g. Q&A only) and intentionally declare no entity binding — there is no `entities` field to inspect.
+      code: S2C6
+    - id: when_grounded_every_grounding_supplied_goal_id_appears
+      scope: per-task
+      what: When grounded, every grounding-supplied goal ID appears in the output unchanged.
+      why: Dropping or renaming a grounding-supplied goal ID silently invalidates every downstream evidence pointer keyed
+        on that ID, producing a task that grades against a different goal set than the grounding describes.
+      suggestion: When grounded, treat grounding goals as immutable and only allow stage 2 to append new procedural goals;
+        assert ID-set superset relation.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 2 (Goals). It diffs the `goals[].id` set in `task-designer/grounding/<name>.yaml`
+        against the IDs in `stage_02.json` to confirm Stage 2 preserved them verbatim. A task lands here when no grounding
+        file exists (grounding is opt-in) — Stage 2 generated the goal IDs procedurally and there is nothing to compare against.
+      code: S2C7
+    code: S2
+  - name: Stage 3 — Subgoals and Q&A chains
+    id: stage_3_subgoals_and_q_a_chains
+    summary: Decomposes each goal into subgoals; emits a Q&A chain (length controlled by `config.difficulty.qa_chain_length`)
+      that determines investigation hops + where evidence is placed.
+    files:
+    - stages/s03_subgoals.py
+    - tables/subgoal_expansions.yaml`.
+    checks:
+    - id: every_goal_has_at_least_one_subgoal_no_orphan_goals
+      scope: per-task
+      what: Every goal has at least one subgoal; no orphan goals.
+      why: An orphan goal has no Q&A chain, so no evidence gets placed and no investigation hops are seeded — the agent passes
+        trivially because there's nothing concrete to discover.
+      suggestion: Assert `len(subgoals_by_goal[g.id]) >= 1` for every emitted goal at stage 3 exit, surfacing the goal-type
+        whose row in `subgoal_expansions.yaml` is missing.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It reads `stage_03.json`'s `subgoals[]`
+        and confirms every goal ID from Stage 2 appears at least once as a `parent_id`. A task lands here when its config
+        disables subgoal decomposition (single-hop goals only) — Stage 3 emits no subgoals because the goals are already atomic.
+      code: S3C1
+      script: audit/scripts/s03_subgoals.py::every_goal_has_at_least_one_subgoal_no_orphan_goals
+    - id: every_subgoal_s_references_a_real_goal
+      scope: per-task
+      what: Every subgoal's `parent_id` references a real goal.
+      why: 'A subgoal pointing at a non-existent `parent_id` becomes a phantom node: it places evidence and consumes a Q&A
+        hop, but no goal grades against it, so the work is silently uncredited.'
+      suggestion: Build a goal-ID set in stage 2 and validate every subgoal's `parent_id` membership before stage 3 returns.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It walks every `subgoals[].parent_id`
+        in `stage_03.json` and confirms it resolves to a goal in `stage_02.json`. A task lands here when Stage 3 emits no
+        subgoals at all (single-hop config), so there are no parent references to resolve.
+      code: S3C2
+      script: audit/scripts/s02_goals.py::every_subgoal_references_real_goal
+    - id: qa_chain_length_per_goal_equals_or_falls_within_1_of
+      scope: per-task
+      what: QA-chain length per goal equals (or falls within ±1 of) `config.difficulty.qa_chain_length`.
+      why: Drifting chain lengths break the difficulty contract — short chains let agents one-shot the answer (free credit),
+        long chains exceed turn budgets and tank pass rates relative to the calibration target.
+      suggestion: Enforce `abs(actual - config.difficulty.qa_chain_length) <= 1` per goal at stage 3 exit and surface the
+        goal type causing the variance.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It measures the length of each
+        `qa_chain[]` in `stage_03.json` against `config.difficulty.qa_chain_length`. A task lands here when its config omits
+        `difficulty.qa_chain_length` entirely — Stage 3 emits no QA chain and there is no target length to compare against.
+      code: S3C3
+      script: audit/scripts/s03_subgoals.py::qa_chain_length_per_goal_within_band
+    - id: evidence_placement_distribution_within_the_task
+      scope: per-task
+      what: Evidence-placement distribution within the task roughly matches `config.difficulty.evidence_weights` (chi-square
+        or proportion check; don't expect exact).
+      why: Skewed placement (e.g. everything in the wiki) means the agent always wins by checking one surface; the task no
+        longer tests multi-surface triangulation as the difficulty config promised.
+      suggestion: Run a chi-square or max-deviation check against `config.difficulty.evidence_weights` and reject tasks whose
+        distribution exceeds the configured tolerance.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It counts evidence placements
+        across surfaces in `stage_03.json` and compares the distribution against `config.difficulty.evidence_weights`. A task
+        lands here when it has too few evidence placements for a statistically meaningful comparison (single-hop or single-surface
+        tasks where the chi-square would be degenerate).
+      code: S3C4
+    - id: subgoal_ids_unique_across_the_task
+      scope: per-task
+      what: Subgoal IDs unique across the task.
+      why: 'Duplicate subgoal IDs cause evidence-pointer collisions in the coverage manifest: two different findings get written
+        to the same artifact path, overwriting each other at hydration time.'
+      suggestion: Namespace subgoal IDs with their `parent_id` (e.g. `g3.s1`) and assert global uniqueness before returning
+        from stage 3.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It reads the `subgoals[].id`
+        set in `stage_03.json` and confirms no duplicates. A task lands here when Stage 3 emitted zero or one subgoal, making
+        uniqueness structurally vacuous.
+      code: S3C5
+      script: audit/scripts/s02_goals.py::subgoal_ids_unique_across_the_task
+    - id: each_subgoal_expansion_comes_from_a_row_in_no_llm
+      scope: per-task
+      what: Each subgoal expansion comes from a row in `tables/subgoal_expansions.yaml` (no LLM-invented decompositions at
+        this stage).
+      why: LLM-invented decompositions at this stage produce non-reproducible subgoal shapes that downstream stages can't
+        bind reward kinds to, breaking the closed-set invariant and causing regen drift.
+      suggestion: Hard-gate stage 3 expansions to row lookups in `tables/subgoal_expansions.yaml`; if no row matches, fail
+        loudly rather than synthesizing.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 3 (Subgoals and Q&A chains). It validates that every subgoal
+        in `stage_03.json` traces back to a row in `tables/subgoal_expansions.yaml` (no free-form LLM invention at this procedural
+        stage). A task lands here when its goals are explicitly flagged in config as needing free-form decomposition outside
+        the closed expansion table — the table-lookup invariant is deliberately disabled.
+      code: S3C6
+      script: audit/scripts/s03_subgoals.py::each_subgoal_expansion_comes_from_a_row
+    code: S3
+  - name: Stage 4 — Dependency edges
+    id: stage_4_dependency_edges
+    summary: Builds the goal DAG from edge-pattern templates. Inserts metagoals (ordering traps, destructive-order traps)
+      when `metagoals.*` is configured.
+    files:
+    - stages/s04_edges.py
+    - tables/edge_patterns.yaml`.
+    checks:
+    - id: dag_check_holds_no_cycles_auditor_re_runs_on_the
+      scope: per-task
+      what: DAG check holds (no cycles); auditor re-runs `_has_cycle` on the emitted edges.
+      why: A cycle in the goal graph makes the runtime's topological ordering ill-defined, so ordering-trap metagoals can
+        be "satisfied" by walking the cycle the wrong way and the agent collects undeserved credit.
+      suggestion: Re-run `_has_cycle` (DFS with grey/black coloring) on the emitted edge list at stage 4 exit and fail with
+        the offending back-edge.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It re-runs `_has_cycle` on the `edges[]`
+        array in `stage_04.json` to confirm the goal graph is acyclic. A task lands here when it has fewer than two goals,
+        so Stage 4 emits no edges and cycle detection is structurally vacuous.
+      code: S4C1
+      script: audit/scripts/s04_edges.py::dag_check_holds_no_cycles
+    - id: every_edge_endpoint_resolves_to_a_declared_goal_id
+      scope: per-task
+      what: Every edge endpoint (`from`, `to`) resolves to a declared goal ID.
+      why: 'Dangling endpoints make edges unenforceable: ordering traps that depend on them silently pass because the missing
+        node never "completes," so destructive-order rewards never fire.'
+      suggestion: Validate every `from`/`to` against the stage-2 goal-ID set immediately after edge generation in stage 4.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It resolves each `edges[].from` and
+        `edges[].to` in `stage_04.json` against the goal IDs in `stage_02.json`. A task lands here when Stage 4 emitted no
+        dependency edges (single-goal task or edges-disabled config), so there are no endpoints to resolve.
+      code: S4C2
+      script: audit/scripts/s04_edges.py::every_edge_endpoint_resolves
+    - id: every_goal_participates_in_at_least_one_edge_or_is
+      scope: per-task
+      what: Every goal participates in at least one edge OR is explicitly terminal in `tables/edge_patterns.yaml`.
+      why: An isolated goal can be completed in any order without tripping ordering traps, so the metagoals that depend on
+        its position in the DAG never fire — destructive-edit traps in particular leak free credit.
+      suggestion: Cross-check each goal against the edge list and the terminal allow-list in `tables/edge_patterns.yaml`;
+        reject isolated non-terminal goals.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It cross-checks each goal in `stage_02.json`
+        against `stage_04.json`'s edges and the terminal-goal allow-list in `tables/edge_patterns.yaml`. A task lands here
+        when it has only a single goal — edge participation is undefined for a one-node graph.
+      code: S4C3
+      script: audit/scripts/s04_edges.py::every_goal_participates_in_at_least_one_edge
+    - id: no_duplicate_edges_same_pair
+      scope: per-task
+      what: No duplicate edges (same `from→to` pair).
+      why: Duplicate edges double-count toward edge-density bands and can cause ordering-trap rewards to fire twice for one
+        violation, throwing off both calibration metrics and grader sums.
+      suggestion: Deduplicate the edge list with a `set((from,to))` pass and assert `len(edges) == len(set(edges))` at stage
+        4 exit.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It scans `stage_04.json`'s `edges[]`
+        for any repeated `(from, to)` pair. A task lands here when Stage 4 emitted fewer than two edges, making duplication
+        structurally impossible.
+      code: S4C4
+      script: audit/scripts/s04_edges.py::no_duplicate_edges
+    - id: metagoal_ids_are_unique_and_their_referenced_goals
+      scope: per-task
+      what: Metagoal IDs are unique and their referenced goals exist.
+      why: Duplicate metagoal IDs cause the reward compiler to register two checks under one name (later overwrites earlier),
+        and references to missing goals make destructive-order traps unenforceable.
+      suggestion: Assert ID uniqueness in the metagoal list and validate every referenced goal against the stage-2 goal set
+        when `metagoals.*` is configured.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It reads the `metagoals[]` section
+        of `stage_04.json` and validates uniqueness plus goal-reference resolution. A task lands here when its config doesn't
+        enable any `metagoals.*` section (metagoals are opt-in per config) — Stage 4 emits no metagoals to validate.
+      code: S4C5
+      script: audit/scripts/s04_edges.py::metagoal_ids_unique_and_referenced_goals_exist
+    - id: edge_density_falls_within_band
+      scope: per-task
+      what: Edge density falls within `config.structure.edge_density` band.
+      why: 'Out-of-band density breaks the structural difficulty contract: low density makes the DAG near-linear and trivial
+        to walk, high density creates unsolvable ordering tangles that tank pass rate.'
+      suggestion: Compute `|edges| / |goals|` after stage 4 and clamp against `config.structure.edge_density`; regenerate
+        edges with a tighter pattern set when out-of-band.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 4 (Dependency edges). It computes the edge-to-goal ratio
+        from `stage_04.json` and compares against `config.structure.edge_density`. A task lands here when its config omits
+        a `structure.edge_density` band — edge density is then unconstrained by design.
+      code: S4C6
+      script: audit/scripts/s04_edges.py::edge_density_falls_within_band
+    code: S4
+  - name: Stage 5 — Action matrix
+    id: stage_5_action_matrix
+    summary: 'Walks each entity (repo, wiki, issue, PR, file, …) and emits the action rows the agent could take: target /
+      distractor / read-only.'
+    files:
+    - stages/s05_action_matrix.py
+    - tables/action_matrix.yaml`.
+    checks:
+    - id: every_action_entry_has_a_target_entity_declared_in_the
+      scope: per-task
+      what: Every action entry has a target entity declared in the inventory.
+      why: An action targeting an unknown entity has no hydration site, so the corresponding reward at grade time queries
+        a non-existent surface and either always-fails (broken golden) or always-passes (free credit) depending on the kind.
+      suggestion: Cross-reference every `action.entity` against the gym's inventory enum at stage 5 exit and fail with the
+        offending row.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It walks each row in `stage_05.json`'s
+        action matrix and confirms the target entity exists in the inventory. A task lands here when Stage 5 emits no action
+        matrix at all — typical for pure-Q&A or read-only investigation tasks where the agent never performs a write action.
+      code: S5C1
+      script: audit/scripts/s05_action_matrix.py::every_action_entry_has_a_target_entity_declared_in_the
+    - id: target_distractor_read_only_ratio_matches
+      scope: per-task
+      what: target/distractor/read-only ratio matches `config.structure.distractor_ratio`.
+      why: 'Off-ratio matrices break difficulty calibration: too few distractors makes the task a single-path walk (high pass
+        rate), too many overwhelms turn budget and collapses pass rate below the [0.1, 0.5) target.'
+      suggestion: Compute the target/distractor/read-only ratio and clamp against `config.structure.distractor_ratio`; resample
+        action rows when off-band.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It tallies the row-type distribution in
+        `stage_05.json` and compares against `config.structure.distractor_ratio`. A task lands here when its config omits
+        `structure.distractor_ratio` entirely — no ratio target is declared, so there is nothing to enforce.
+      code: S5C2
+    - id: no_duplicate_pairs
+      scope: per-task
+      what: No duplicate `(entity, verb)` pairs.
+      why: Duplicate `(entity, verb)` rows produce two reward declarations in stage 6 with the same `name:` after templating,
+        so the coverage manifest's bijection breaks and one is silently overwritten.
+      suggestion: Deduplicate via a `set((entity, verb))` pass at the end of stage 5 and assert no collisions.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It scans `stage_05.json` for any repeated
+        `(entity, verb)` pair. A task lands here when Stage 5 emitted fewer than two action rows, making duplication structurally
+        impossible.
+      code: S5C3
+      script: audit/scripts/s05_action_matrix.py::no_duplicate_pairs
+    - id: every_verb_in_the_matrix_maps_to_a_known_reward_kind
+      scope: per-task
+      what: Every verb in the matrix maps to a known reward kind in the gym's reward registry (catches "the world designer
+        planned a verb that the gym can't compile a check for").
+      why: A verb with no reward-registry mapping compiles to no check at grade time, so the agent can perform that action
+        and collect (or skip) it with zero consequence — a hidden free-credit hole.
+      suggestion: Look up every verb in the gym's reward registry at stage 5 exit and reject tasks whose matrix references
+        unmapped verbs.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It maps each `verb` in `stage_05.json`
+        to the gym's closed reward registry to catch verbs the compiler can't grade. A task lands here when Stage 5 emits
+        no action verbs (investigation-only tasks where the agent never acts on an entity).
+      code: S5C4
+      script: audit/scripts/s05_action_matrix.py::every_verb_in_the_matrix_maps_to_a_known_reward_kind
+    - id: each_goal_in_the_dag_has_at_least_one_action_row
+      scope: per-task
+      what: Each goal in the DAG has at least one **target** action row (reachable from the seed).
+      why: A goal with no target action row has no concrete observable for the grader to bind to, so the goal silently passes
+        (or silently fails) regardless of agent behavior — the goal effectively doesn't exist.
+      suggestion: Group action rows by `goal_id` and assert each goal has `>= 1` target-classified row before stage 6.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It cross-references each goal in `stage_02.json`
+        against `stage_05.json` and confirms at least one target row is reachable from the seed. A task lands here when the
+        task's goals are all answer-only — no goal in the DAG requires an entity action, so the matrix-row requirement does
+        not apply.
+      code: S5C5
+    - id: distractors_are_paired_for_every_distractor_at_least
+      scope: per-task
+      what: 'Distractors are paired: for every distractor, at least one same-kind target exists (avoids "distractor with nothing
+        to confuse").'
+      why: Unpaired distractors are obvious to the agent (only one entity of that kind exists, so it must be the target) —
+        the confusion mechanism disappears and the task's difficulty band collapses.
+      suggestion: For each distractor row, assert at least one same-kind target exists in the matrix; otherwise drop the distractor
+        or promote a same-kind target.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 5 (Action matrix). It groups `stage_05.json` rows by entity
+        kind and confirms every distractor has a same-kind target to be confused with. A task lands here when the task declares
+        zero distractors in its action matrix (`config.structure.distractor_count == 0` or no distractor rows emitted), so
+        the pairing invariant is trivially satisfied.
+      code: S5C6
+    code: S5
+  - name: Substages 5b–5e — Structural planning
+    id: substages_5b_5e_structural_planning
+    summary: ''
+    files: []
+    checks:
+    - id: convention_placements_name_a_format_e_g_a_content
+      scope: per-task
+      what: '**5b:** convention placements name a *format* (e.g. "a content surface titled ''Conventions''") and never the
+        *answer*; auditor greps for hint-style phrases ("do not", "this is the bug") in any convention body and fails on hit.'
+      why: If a convention surface leaks the answer text ("do not commit secrets — this is the bug"), the agent reads it and
+        wins without investigation, producing a hint-leak that calibration won't catch but evals will.
+      suggestion: Grep convention bodies for hint phrases (`"do not"`, `"this is the bug"`, `"the issue is"`) at 5b exit and
+        fail on hit; keep placements as format-only.
+      na_reason: This check belongs to Phase 1 — Skeleton, Substage 5b (Convention placements). It reads `stage_05b.json`
+        and greps the bodies of declared convention placements for answer-leaking phrases. A task lands here when Stage 5b
+        emits no convention placements at all — convention surfaces are an opt-in structural element.
+      code: S5bC1
+    - id: visual_finding_count_matches_every_is_in_the_closed
+      scope: per-task
+      what: '**5c:** visual-finding count matches `config.difficulty.visual_finding_count`; every `defect_type` is in the
+        closed catalog; every `placement` belongs to the closed set of agent-visible content surfaces.'
+      why: Out-of-closed-set defect types or placements can't be rendered by hydration, so the planned visual finding never
+        appears in the world and its grader either over-fires (false fail) or never fires (free credit).
+      suggestion: Validate every `defect_type` against the closed catalog and every `placement` against the agent-visible
+        surfaces enum at 5c exit; check count matches `config.difficulty.visual_finding_count`.
+      na_reason: This check belongs to Phase 1 — Skeleton, Substage 5c (Visual findings plan). It reads `stage_05c.json` and
+        validates count, defect-type enum membership, and placement-surface closure. A task lands here when the task type
+        is non-visual and Stage 5c emits no visual findings — visual planning is opt-in to visual task types only.
+      code: S5bC2
+    - id: distractor_count_matches_every_distractor_declares_a
+      scope: per-task
+      what: '**5d:** distractor count matches `config.structure.distractor_count`; every distractor declares a **guard reward
+        kind** (`no_extra_*`); for each target reward, at least one structural distractor exists. *This is the per-task analog
+        of the rubric check [`distractors_procedurally_generated`].*'
+      why: A distractor without a `no_extra_*` guard means the agent gets credit for touching the wrong surface — the whole
+        point of the distractor (penalize wrong action) is silently disabled.
+      suggestion: Assert every distractor at 5d declares a `no_extra_*` guard reward kind, and verify each target reward has
+        at least one paired structural distractor.
+      na_reason: This check belongs to Phase 1 — Skeleton, Substage 5d (Distractor plan). It reads `stage_05d.json` and confirms
+        count matches `config.structure.distractor_count`, every distractor has a `no_extra_*` guard kind, and target rewards
+        are paired. A task lands here when `config.structure.distractor_count == 0` or Stage 5d is skipped — distractors are
+        an opt-in structural element.
+      code: S5bC3
+    - id: every_tech_stack_choice_belongs_to_the_closed_set
+      scope: per-task
+      what: '**5e:** every tech-stack choice belongs to the closed set declared in `config`; cross-choices are internally
+        consistent (no mismatched language / build tool pairs).'
+      why: Off-set or internally-mismatched tech stacks (e.g. Python language + Maven build) produce unhydratable worlds where
+        files reference tools that don't exist, so the agent sees a broken scaffold and grade-time path checks fail.
+      suggestion: Validate each tech-stack field against the `config` closed set at 5e exit and run a cross-consistency table
+        (language↔build-tool↔framework) before returning.
+      na_reason: This check belongs to Phase 1 — Skeleton, Substage 5e (Tech-stack choices). It reads `stage_05e.json` and
+        validates each choice against the closed set in `config` plus cross-choice consistency rules. A task lands here when
+        no tech-stack choices are made in Stage 5e — typical when there is no scaffolded codebase (e.g. pure docs-investigation
+        tasks).
+      code: S5bC4
+    - id: all_four_substage_outputs_must_be_deterministic_given
+      scope: per-stage
+      what: All four substage outputs must be deterministic given the same seed + config + previous stages — auditor re-runs
+        and diffs.
+      why: Non-determinism in 5b–5e means every regen produces a different placement set / distractor set / tech stack, so
+        previously-validated goldens drift and snapshots become unreproducible.
+      suggestion: Run each substage twice with the same `(seed, config, prior_stages)` and diff the outputs in CI; chase down
+        any unseeded `random`/dict-iteration source.
+      code: S5bC5
+    code: S5b
+  - name: Stage 6 — Reward declarations + coverage manifest
+    id: stage_6_reward_declarations_coverage_manifest
+    summary: 'Materializes the action matrix into compiler-format reward declarations (`agent_created_issue`, `file_content_replaced`,
+      `state_unchanged`, …) and builds a **coverage manifest**: every reward maps to evidence pointers (files / wiki / issues
+      / reasoning hops).'
+    files:
+    - stages/s06_rewards.py
+    - prompts/reward_compiler_spec.md
+    - gym_github/table_writes.py` (write-table source of truth).
+    checks:
+    - id: task_emits_at_least_one_reward
+      scope: per-task
+      what: Stage 6 emits at least one reward declaration — the task is gradable at all.
+      why: A task without rewards is unscorable by construction. Stage 14 (golden solution) has nothing to verify, stage 15
+        (verify+fix) has nothing to run, and at runtime the grader returns an empty subscore set. Every other Stage 6 check
+        (registered kind, writes_to consistency, coverage manifest bijection) is vacuous on an empty reward list.
+      suggestion: Assert `len(stage_06.json['rewards']) >= 1` at stage 6 exit; if the action matrix was empty, fix upstream
+        rather than emitting a zero-reward task.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It opens `task-designer/drafts/<task>/stage_06.json`
+        and reads its `reward_skeleton.templates` list. A task lands here when no draft Stage 6 artifact exists — most commonly
+        because the task is a SHIPPED world under `task-designer/worlds/` (already past Stage 6, with the draft cleaned up),
+        the task aborted before reaching Stage 6, or the audit labeled the same draft under a different ID convention. A task
+        that genuinely reached Stage 6 with zero reward templates would appear as FAIL, not N/A.
+      code: S6C1
+      script: audit/scripts/floor_checks.py::task_emits_at_least_one_reward
+    - id: every_is_in_the_gym_s_registered_closed_reward
+      scope: per-task
+      what: Every `reward.kind` is in the gym's registered closed reward universe (closed-check-universe invariant at design
+        time).
+      why: An unregistered `reward.kind` cannot compile at grade time — the check is silently dropped from the grader, so
+        the agent's behavior on that surface is never scored (free credit on every run).
+      suggestion: Look up every emitted `reward.kind` against the gym's closed reward universe at stage 6 exit and hard-fail
+        with the offending kind name.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It validates
+        every `reward.kind` in `stage_06.json` against the gym's closed reward registry. A task lands here when Stage 6 emits
+        no reward declarations — typical for planning-only drafts or pipelines that aborted before Stage 6 ran.
+      code: S6C2
+      script: audit/scripts/s06_rewards.py::every_reward_kind_in_registered_closed_set
+    - id: each_declared_write_target_or_equivalent_is_in_the_gym
+      scope: per-task
+      what: Each declared write-target (`writes_to:` or equivalent) is in the gym's closed set of agent-writable surfaces.
+      why: A write-target outside the gym's writable set means hydration has nowhere to render the surface and the corresponding
+        `no_extra_*` guard fires (or fails to fire) based on an unrendered path — broken golden either way.
+      suggestion: Cross-check every `writes_to:` against the gym's closed writable-surface enum before emitting the reward;
+        reject the matrix row, don't patch the kind.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It walks each
+        `writes_to:` (or equivalent) field in `stage_06.json` and validates against the gym's closed set of agent-writable
+        surfaces in `gym_github/table_writes.py`. A task lands here when all rewards are read-only or answer-style — no `writes_to`
+        is declared, so there is nothing to validate.
+      code: S6C3
+    - id: for_every_action_whose_target_is_a_writable_surface_a
+      scope: per-task
+      what: For every action whose target is a writable surface, a dedup field (`accounted_by` or equivalent) is present —
+        else the corresponding "no-extra-X" guard will over-fire at grade time.
+      why: Missing `accounted_by` on a writable surface causes `no_extra_*` guards to count the agent's legitimate target
+        write as an "extra," so the grader docks credit for the correct action — a systematic false-fail.
+      suggestion: After stage 6, scan rewards whose target is in the writable-surfaces set and assert `accounted_by` (or equivalent)
+        is present and non-empty.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It confirms
+        each write-targeting reward in `stage_06.json` carries an `accounted_by` (or equivalent) dedup field so the paired
+        `no_extra_*` guard doesn't over-fire at grade time. A task lands here when no action targets a writable surface —
+        typical for pure investigation or answer-only tasks.
+      code: S6C4
+    - id: target_distractor_reward_count_matches_the_matrix_from
+      scope: per-task
+      what: Target/distractor reward count matches the matrix from stage 5 — no rewards added or dropped.
+      why: Drift between the action matrix and emitted rewards means stage 5's distractor budget no longer matches what's
+        graded — typically one over-fires (false fail) or one is missing (free credit on that surface).
+      suggestion: Group both stage 5 matrix rows and stage 6 rewards by classification and assert exact count equality per
+        (target, distractor) bucket.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It diffs reward
+        counts in `stage_06.json` against the target/distractor row counts in `stage_05.json` to ensure none were silently
+        added or dropped. A task lands here when Stage 5 emitted no action matrix in the first place — there is no baseline
+        to compare against.
+      code: S6C5
+      script: audit/scripts/s06_rewards.py::target_distractor_reward_count_matches_the_matrix_from
+    - id: coverage_manifest_is_bijective_with_rewards_paired_by
+      scope: per-task
+      what: 'Coverage manifest is bijective with rewards: `len(coverage) == len(rewards)`, paired by exact `name:`.'
+      why: A non-bijective manifest means some reward has no planned evidence (hydration writes nothing → grader always-fails)
+        or some evidence has no reward (hydration writes a leaky hint with no scoring → free credit).
+      suggestion: Assert `len(coverage) == len(rewards)` and run a set-equality check on the `name:` fields at stage 6 exit;
+        surface unmatched names on both sides.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It pairs `stage_06.json`'s
+        `coverage[]` to `rewards[]` by exact `name:` and requires `len(coverage) == len(rewards)`. A task lands here when
+        Stage 6 doesn't emit a coverage manifest — legacy or minimal task formats predating the manifest invariant.
+      code: S6C6
+    - id: no_template_placeholders_in_reward_names_generic_verbs
+      scope: per-task
+      what: No template placeholders in reward names (`TARGET_REPO_*`, generic verbs, etc.).
+      why: Placeholder names like `TARGET_REPO_*` make every task share a reward name across the corpus, so accounted-by dedup
+        collapses multiple distinct checks into one and grading becomes globally wrong.
+      suggestion: Regex-grep reward `name:` for uppercase placeholders and generic-verb patterns at stage 6 exit; fail with
+        the template that didn't get substituted.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It greps `reward.name`
+        strings in `stage_06.json` for unresolved placeholders like `TARGET_REPO_*` or generic verbs. A task lands here when
+        Stage 6 emits no rewards at all, so there are no names to inspect.
+      code: S6C7
+      script: audit/scripts/s06_rewards.py::no_template_placeholders_in_reward_names
+    - id: evidence_pointers_resolve_every_triple_has_a_planned
+      scope: per-task
+      what: 'Evidence pointers resolve: every `(entity_kind, entity_id, artifact_path)` triple has a planned home in the world
+        (will be filled by hydration).'
+      why: An unresolvable `(entity_kind, entity_id, artifact_path)` triple means hydration has no place to write the evidence,
+        so the agent can't discover the answer through the planned path — task becomes unsolvable.
+      suggestion: Validate every coverage triple against the planned-world inventory (from stages 4–5e) at stage 6 exit and
+        reject tasks with dangling pointers.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It walks each
+        `(entity_kind, entity_id, artifact_path)` triple in `stage_06.json`'s coverage manifest and confirms a planned home
+        exists for hydration to fill. A task lands here when rewards declare no evidence pointers — typical for pure state-diff
+        rewards graded entirely off DB queries with no evidence grounding.
+      code: S6C8
+    - id: mutual_exclusion_sets_cover_all_sibling_action_verbs
+      scope: per-task
+      what: Mutual-exclusion sets cover all sibling action verbs on the same entity (e.g. `create_X` vs `edit_X` cannot both
+        award credit).
+      why: Without mutual-exclusion sets, `create_X` and `edit_X` on the same entity both award credit, so the agent gets
+        paid twice for one logical action and pass rate inflates above the calibrated target.
+      suggestion: Group rewards by `(entity_kind, entity_id)` and assert each sibling-verb set is declared in a mutual-exclusion
+        group before stage 6 returns.
+      na_reason: This check belongs to Phase 1 — Skeleton, Stage 6 (Reward declarations + coverage manifest). It groups `stage_06.json`
+        rewards by entity and confirms sibling verbs (e.g. `create_X` vs `edit_X`) appear in the same mutual-exclusion set
+        so credit can't be double-awarded. A task lands here when no entity has multiple action verbs in the matrix — each
+        entity is touched by at most one verb, so there are no siblings to mutually exclude.
+      code: S6C9
+    code: S6
+- name: Phase 2 — Hydration (LLM)
+  id: phase_2_hydration_llm
+  corpus: draft
+  corpus_path: task-designer/drafts/
+  stages:
+  - name: Stage 7 — Narrative
+    id: stage_7_narrative
+    summary: First LLM call. Turns the procedural skeleton into a real-world narrative (story, entity names, terminology)
+      without inventing structure.
+    files:
+    - stages/s07_narrative.py
+    - prompts/narrative.md`.
+    checks:
+    - id: entity_name_diversity_no_all_greek_letter_or_all
+      scope: per-task
+      what: 'Entity name diversity: no all-Greek-letter (`alpha/beta/gamma`) or all-generic (`entity1/entity2`) sets; auditor
+        flags Levenshtein-similarity > 0.7 across same-kind entities.'
+      why: Greek-letter or `entity1/entity2` names make distractors trivially distinguishable as 'the planted one,' destroying
+        the cognitive load the task was sized for and inflating pass-rate above the calibration band.
+      suggestion: In stage_7_narrative, post-process LLM output through a name-diversity check (Levenshtein < 0.7, no `\b(alpha|beta|gamma|entity\d+)\b`)
+        and re-prompt with rejected names listed.
+      na_reason: This check belongs to Phase 2, Stage 7 (Narrative), and reads the hydrated entity-name set against the kind
+        groupings produced by Stage 5's action-matrix inventory in stage_05.json. It compares same-kind peers (Levenshtein
+        > 0.7) to catch lazy naming like alpha/beta/gamma. The task lands N/A because its Stage 5 inventory declared fewer
+        than two entities of any single kind, so there is no peer set to compare names against.
+      code: S7C1
+    - id: entity_count_per_kind_matches_stage_5_inventory
+      scope: per-task
+      what: Entity count per kind matches stage 5 inventory exactly (LLM didn't add or drop entities).
+      why: If the LLM silently adds an entity, stage 6's reward bindings reference an entity the world doesn't have (or vice
+        versa) — graders fail to resolve targets and goldens break at runtime.
+      suggestion: After stage 7, diff hydrated kind-counts against stage 5's inventory; on mismatch reject the response and
+        re-prompt with the exact required counts.
+      na_reason: This Phase 2, Stage 7 check diffs the hydrated entity count per kind against the inventory recorded in stage_05.json
+        to confirm the LLM did not add or drop entities during narrative hydration. It is N/A here because Stage 5 produced
+        no entity inventory at all — typical for pure-prompt or answer-only tasks that have no world entities to hydrate,
+        leaving nothing to count against.
+      code: S7C2
+    - id: body_contains_zero_matches_against_the_hint_leak_regex
+      scope: per-task
+      what: '`narrative_hints` body contains zero matches against the hint-leak regex (same patterns used by `_check_answer_hints`).'
+      why: Narrative copy is the easiest place for the LLM to telegraph the answer ('the real culprit is…'), giving the agent
+        a free win without doing the investigation the task is meant to score.
+      suggestion: Run `_check_answer_hints` regex over `narrative_hints.body` immediately after stage 7 and gate progression
+        on zero matches.
+      na_reason: This Phase 2, Stage 7 check reads the `narrative_hints` body from the Stage 7 narrative artifact and runs
+        the hint-leak regex (same patterns as `_check_answer_hints`) over it. The task lands N/A because its Stage 7 output
+        omitted the `narrative_hints` field entirely, so there is no body of text for the regex to scan.
+      code: S7C3
+    - id: domain_vocabulary_is_present_in_terminology_matches
+      scope: per-task
+      what: Domain vocabulary is present in `conventions` — terminology matches the task's stated domain rather than generic
+        verbs.
+      why: Generic verbs ('do the thing', 'check the system') make tasks read as templates rather than real artifacts — degrades
+        realism, lowers face-validity, and weakens transfer to actual product work.
+      suggestion: Pass the declared domain (e.g. `fintech`, `devops`) into the stage 7 prompt and require ≥N domain-specific
+        terms in `conventions`; flag if absent.
+      na_reason: This Phase 2, Stage 7 check inspects the `conventions` block of the Stage 7 narrative artifact, looking for
+        domain-specific terminology rather than generic verbs. It is N/A because either the narrative omitted the `conventions`
+        block, or the task's objective is domain-neutral and declares no domain whose vocabulary could be matched.
+      code: S7C4
+    - id: every_entity_id_referenced_by_stages_1_6_has_a_name
+      scope: per-task
+      what: Every entity ID referenced by stages 1–6 has a name field assigned.
+      why: An unnamed entity propagates as a raw ID through stage 8's YAML and the prompt, producing artifacts like 'review
+        PR `repo_3_pr_2`' that look broken and confuse the agent.
+      suggestion: After stage 7, enumerate IDs from stages 1–6 and assert each has a `name` in the narrative payload; re-prompt
+        for any missing.
+      na_reason: This Phase 2, Stage 7 check walks the entity IDs declared across Phase 1 outputs (stage_01.json through stage_06.json)
+        and confirms each one has a `name` assigned in the hydrated narrative. It is N/A because Stages 1–6 declared no entity
+        IDs for this task — common for answer-only tasks with no world graph to name.
+      code: S7C5
+    - id: auditor_re_runs_llm_verification_by_sampling_3_entity
+      scope: per-task
+      what: 'Auditor re-runs LLM verification by sampling 3 entity descriptions and asking a separate verifier: "does this
+        read like a real-company artifact or like a template?"'
+      why: Regex checks miss subtle template-tells ('Acme Corp engineer reported the issue'); without a semantic re-check,
+        generic prose ships and human reviewers reject the batch downstream.
+      suggestion: Add an auditor sampler that picks 3 entity descriptions and prompts a verifier LLM with 'real artifact or
+        template?' — gate on majority real.
+      na_reason: This Phase 2, Stage 7 check samples three hydrated entity descriptions from the Stage 7 narrative artifact
+        and runs a separate LLM verifier to judge whether each reads like a real-company artifact rather than a template.
+        It is N/A because the task produced fewer than three hydrated entity descriptions, so the 3-sample protocol cannot
+        execute.
+      code: S7C6
+    code: S7
+  - name: Stage 7b — YAML skeleton
+    id: stage_7b_yaml_skeleton
+    summary: Builds a **parseable, linter-clean** YAML skeleton with `LLM_MUST_FILL_THIS_PLACEHOLDER` tags. No LLM. Hydration
+      fills placeholders rather than inventing structure.
+    files:
+    - stages/s07b_skeleton.py`.
+    checks:
+    - id: task_has_non_empty_prompt
+      scope: per-task
+      what: Skeleton declares a non-empty `task.prompt` (placeholder or filled) — the agent will have instructions to act
+        on.
+      why: An empty prompt makes the task unsolvable — the agent doesn't know what to do, hydration has nothing to anchor
+        rewriting against, and the grader scores zero by default. Every downstream prompt-grounding check assumes the prompt
+        is non-empty.
+      suggestion: Require a non-empty `task.prompt` field in the skeleton (placeholder OK at stage 7b); add a stage-exit assertion
+        `len(skeleton['task']['prompt'].strip()) > 0`.
+      na_reason: This check belongs to Phase 2 — Hydration, Stage 7b (YAML skeleton). It opens `task-designer/drafts/<task>/skeleton.yaml`
+        and reads `task.prompt`. A task lands here when no Stage 7b skeleton was emitted for it — most commonly because the
+        draft is older than the Stage 7b step (the gym added skeleton emission late in its history, so legacy drafts skip
+        straight from Phase 1 to hydration), the draft paused in Phase 1 before reaching Stage 7b, or it's a SHIPPED task
+        whose draft was cleaned up. A task that reached Stage 7b and emitted an empty prompt would appear as FAIL.
+      code: S7bC1
+      script: audit/scripts/floor_checks.py::task_has_non_empty_prompt
+    - id: task_declares_at_least_one_tool
+      scope: per-task
+      what: Skeleton declares at least one entry under `task.tools` — the agent has some way to interact with the world.
+      why: With an empty tool list the agent cannot act, so the task is unsolvable. The runtime tool-list and the canonical-tools
+        lint are both vacuous on an empty `tools:`, so a regression slips through silently.
+      suggestion: Add a stage-exit assertion `len(skeleton['task']['tools']) >= 1` to stage 7b, and validate that the entries
+        belong to the gym's registered tool catalog.
+      na_reason: This check belongs to Phase 2 — Hydration, Stage 7b (YAML skeleton). It opens `task-designer/drafts/<task>/skeleton.yaml`
+        and reads `task.tools[]`. A task lands here when no Stage 7b skeleton artifact exists — most commonly because the
+        draft predates the Stage 7b step (only ~half of drafts in this corpus have a skeleton.yaml), the draft paused before
+        reaching Phase 2, or it's a SHIPPED task whose draft was cleaned up. A task that reached Stage 7b and emitted an empty
+        tool list would appear as FAIL.
+      code: S7bC2
+      script: audit/scripts/floor_checks.py::task_declares_at_least_one_tool
+    - id: skeleton_parses_with
+      scope: per-task
+      what: Skeleton parses with `yaml.safe_load`.
+      why: If the skeleton itself is malformed YAML, stage 8's chunked hydration emits indented sub-trees into a broken parent
+        and the final file fails `yaml.safe_load`, killing every variant in the batch.
+      suggestion: Run `yaml.safe_load` on the skeleton before stage 8 starts; raise immediately on parse error so the skeleton
+        builder (not hydration) gets blamed.
+      na_reason: This Phase 2, Stage 7b check runs `yaml.safe_load` against the Stage 7b skeleton.yaml file. It is N/A because
+        the task did not emit a Stage 7b skeleton artifact — likely a gym variant that hydrates the world YAML directly without
+        the intermediate placeholder-skeleton step.
+      code: S7bC3
+      script: audit/scripts/s07b_skeleton.py::skeleton_parses_with_yaml_safe_load
+    - id: round_trip_stable_modulo_formatting
+      scope: per-task
+      what: 'Round-trip stable: `yaml.dump(yaml.safe_load(skel)) == skel` (modulo formatting).'
+      why: Round-trip instability signals duplicate keys or anchor abuse — silently dropped sections at parse time mean rewards
+        or entities vanish without warning, leading to under-validated tasks.
+      suggestion: Assert `yaml.safe_load → yaml.safe_dump → yaml.safe_load` is idempotent in stage 7b's exit gate.
+      na_reason: This Phase 2, Stage 7b check round-trips the skeleton.yaml file through `yaml.dump(yaml.safe_load(...))`
+        to confirm load/dump stability. It is N/A because no Stage 7b skeleton file was emitted for this task (gyms that skip
+        the placeholder-skeleton step go straight from Stage 7 narrative to Stage 8 hydration).
+      code: S7bC4
+    - id: required_top_level_sections_present_whatever_the_gym_s
+      scope: per-task
+      what: Required top-level sections present (whatever the gym's task schema mandates — e.g. world block, bootstrap, task,
+        coverage manifest).
+      why: Missing top-level sections (e.g. `bootstrap`, `coverage`) cause the world validator to reject the hydrated file
+        at the very end, after expensive LLM calls — wasted spend and stuck pipeline.
+      suggestion: Drive the section list from the gym's Pydantic schema and check presence in stage 7b before any hydration
+        spend.
+      na_reason: This Phase 2, Stage 7b check verifies the gym's required top-level sections (world, bootstrap, task, coverage
+        manifest, etc.) are present in skeleton.yaml. It is N/A because this task's gym schema declares no required top-level
+        sections, so the presence assertion has no list to enforce against.
+      code: S7bC5
+      script: audit/scripts/s07b_skeleton.py::required_top_level_sections_present
+    - id: every_carries_a_comment_hint_describing_what_to_fill
+      scope: per-task
+      what: Every `LLM_MUST_FILL_THIS_PLACEHOLDER` carries a comment hint describing what to fill (else hydration LLM has
+        no signal).
+      why: An unhinted placeholder forces stage 8 to invent content from scratch — leading to off-domain copy, fabricated
+        fields, or answer leakage because the model improvises without scope.
+      suggestion: In `stage_7b_yaml_skeleton.py`, require each `LLM_MUST_FILL_THIS_PLACEHOLDER` to be preceded by a `# hint:`
+        comment and fail-fast if absent.
+      na_reason: This Phase 2, Stage 7b check scans skeleton.yaml for `LLM_MUST_FILL_THIS_PLACEHOLDER` tokens and confirms
+        each has an adjacent comment hint guiding the Stage 8 hydration LLM. It is N/A because the skeleton contains no placeholder
+        tokens — either the task is fully resolved at Stage 7b, or the gym uses a template-free skeleton.
+      code: S7bC6
+      script: audit/scripts/s07b_skeleton.py::placeholders_carry_comment_hint
+    - id: every_reward_from_stage_6_has_a_corresponding_entry_in
+      scope: per-task
+      what: Every reward from stage 6 has a corresponding entry in `task.rewards` (even if fields are placeholders).
+      why: Missing skeleton rows mean stage 8 has nothing to hydrate, so the reward silently disappears from `task.rewards`
+        — the grader runs with fewer assertions and the task is easier than designed.
+      suggestion: Diff stage 6 reward IDs against `task.rewards` keys in the skeleton; raise on any missing entries before
+        stage 8.
+      na_reason: This Phase 2, Stage 7b check cross-references the reward declarations in stage_06.json (reward_skeleton.templates)
+        against `task.rewards` entries in skeleton.yaml. It is N/A because Stage 6 produced no rewards for this task — typical
+        for exploration-only or narrative-shaping tasks where rewards are added in a later stage.
+      code: S7bC7
+    - id: every_entity_from_stage_7_has_a_skeleton_row_in_with
+      scope: per-task
+      what: Every entity from stage 7 has a skeleton row in `world.*` with the correct ID.
+      why: Without a placeholder row, stage 8 won't generate the entity at all, breaking `entity_references_resolve` later
+        and leaving rewards pointing at ghosts that resolve to nothing.
+      suggestion: After stage 7b, assert `set(skeleton.world.*.id) == set(stage_7.entity_ids)` and re-emit on mismatch.
+      na_reason: This Phase 2, Stage 7b check maps each entity from the Stage 7 narrative inventory to a skeleton row under
+        `world.*` in skeleton.yaml, matching by ID. It is N/A because the Stage 7 inventory is empty for this task, so there
+        are no entities requiring skeleton rows.
+      code: S7bC8
+    - id: is_the_gym_s_canonical_tool_list_no_truncation_no
+      scope: per-task
+      what: '`tools:` is the gym''s canonical tool list — no truncation, no foreign tools.'
+      why: If `tools:` is missing a tool the prompt assumes (or contains a foreign one), the agent either can't act or calls
+        an unavailable tool — task is unsolvable or behaves differently across batches.
+      suggestion: Hard-code the canonical tool list from the gym package and compare exactly; never let the LLM author this
+        list.
+      na_reason: This Phase 2, Stage 7b check compares the skeleton's `tools:` list against the gym's canonical closed tool
+        list to catch truncation or foreign tools. It is N/A because the task's gym does not declare a canonical closed tool
+        list — typical for open-tool-set gyms or schemas without a `tools:` field.
+      code: S7bC9
+      script: audit/scripts/s07b_skeleton.py::tools_is_canonical_list
+    code: S7b
+  - name: Stage 8 — Hydrate world YAML
+    id: stage_8_hydrate_world_yaml
+    summary: LLM fills placeholders in chunks (per-repo, per-section) using `prompts/hydrate.md`. Produces the full world.
+    files:
+    - stages/s08_hydrate.py
+    - prompts/hydrate.md`.
+    checks:
+    - id: count_0_across_the_file
+      scope: per-task
+      what: '**Zero surviving placeholders** — `LLM_MUST_FILL_THIS_PLACEHOLDER` count == 0 across the file.'
+      why: Surviving `LLM_MUST_FILL_THIS_PLACEHOLDER` strings ship into the agent context — the agent sees the literal string,
+        the world validator may still pass, but the task is incoherent and pass-rate collapses to zero.
+      suggestion: Grep `LLM_MUST_FILL_THIS_PLACEHOLDER` over the hydrated YAML after stage 8 and fail the task on any hit;
+        re-hydrate only the offending chunk.
+      na_reason: This Phase 2, Stage 8 check `grep`s the hydrated world YAML for any surviving `LLM_MUST_FILL_THIS_PLACEHOLDER`
+        tokens and expects zero. It is N/A because the task bypassed the Stage 7b placeholder-skeleton pathway and hydrated
+        the world YAML directly, so no placeholder tokens were ever introduced to clean up.
+      code: S8C1
+      script: audit/scripts/s07b_skeleton.py::zero_surviving_placeholders_in_hydrated
+    - id: every_cross_reference_field_whatever_names_the_gym
+      scope: per-task
+      what: '**Entity reference closure** — every cross-reference field (whatever names the gym uses for "owner", "actor",
+        "subject", "collaborator", etc.) resolves to a declared entity in the same file.'
+      why: 'Dangling refs (e.g. `owner: bob` when `bob` was never declared) cause the world bootstrap to silently drop the
+        relation or error at runtime — broken golden or unreachable reward target.'
+      suggestion: Run the per-task analog of `entity_references_resolve` over hydrated YAML; for each cross-ref field, assert
+        the value appears in `world.*.id`.
+      na_reason: This Phase 2, Stage 8 check walks every cross-reference field in the hydrated world YAML (owner, actor, subject,
+        collaborator, and gym-specific variants) and confirms each resolves to a declared entity in the same file. It is N/A
+        because the hydrated world declares no cross-reference fields — typical for single-entity or referenceless worlds
+        where no entity points at another.
+      code: S8C2
+      script: audit/scripts/s08_hydrate.py::entity_reference_closure
+    - id: every_entity_referenced_by_a_reward_declaration_has_a
+      scope: per-task
+      what: '**Reward → world reachability** — every entity referenced by a reward declaration has a hydrated row (per-task
+        analog of `entity_references_resolve` and `reward_to_entity_resolution_at_generator`).'
+      why: A reward pointing at a non-existent entity scores 0 deterministically — the agent gets penalised for an authoring
+        bug, dragging the batch's mean reward below the calibration target.
+      suggestion: 'Port `reward_to_entity_resolution_at_generator` into stage 8''s exit gate: for every reward arg that names
+        an entity, assert a hydrated row exists.'
+      na_reason: This Phase 2, Stage 8 check scans the reward declarations in the hydrated YAML, collects every entity ID
+        they cite, and confirms each has a matching hydrated row in `world.*` (the per-task analog of the corpus-level `reward_to_entity_resolution_at_generator`).
+        It is N/A because this task's rewards reference no world entities — typical for pure answer or action-trace rewards.
+      code: S8C3
+    - id: every_entity_referenced_by_a_reward_is_mentioned_by
+      scope: per-task
+      what: '**Prompt → reward grounding** — every entity referenced by a reward is mentioned (by name or unambiguous descriptor)
+        in the `task.prompt` (per-task analog of `prompt_grounds_reward_entities`).'
+      why: If the prompt never names the entity the reward checks, the agent has no breadcrumb to find it — the task is unsolvable
+        for reasons unrelated to capability, and pass-rate floors near zero.
+      suggestion: 'Implement the per-task analog of `prompt_grounds_reward_entities`: enumerate reward entity refs and assert
+        each appears (by name or descriptor) in `task.prompt`.'
+      na_reason: This Phase 2, Stage 8 check collects every entity cited by a reward declaration and confirms each is named
+        or unambiguously described in `task.prompt` (the per-task analog of `prompt_grounds_reward_entities`). It is N/A because
+        this task's rewards reference no entities at all, so prompt-grounding has nothing to ground.
+      code: S8C4
+      script: audit/scripts/s08_hydrate.py::prompt_grounds_reward_entities
+    - id: running_the_gym_s_world_state_validator_on_the_parsed
+      scope: per-task
+      what: '**World schema validates** — running the gym''s world-state validator on the parsed YAML succeeds.'
+      why: If the gym's bootstrap rejects the YAML at container start, the task never reaches the agent — wasted batch and
+        silent attrition in the corpus that's only noticed at evaluation time.
+      suggestion: Call the gym's `WorldState.model_validate` (or equivalent) in stage 8's exit gate and surface validation
+        errors with the offending field path.
+      na_reason: This Phase 2, Stage 8 check feeds the parsed hydrated world YAML through the gym's world-state validator
+        (typically a closed Pydantic model). It is N/A because this task's gym ships no world-state validator — common for
+        world-less gyms or gyms that only validate at runtime rather than at authoring time.
+      code: S8C5
+    - id: counts_per_entity_kind_match_the_stage_5_stage_7
+      scope: per-task
+      what: '**Entity counts match plan** — counts per entity kind match the stage 5 + stage 7 inventory.'
+      why: Hydration drift (extra distractors, missed entities) changes task difficulty silently — a task calibrated to 0.3
+        pass-rate may land at 0.7 because the LLM added two more obvious decoys.
+      suggestion: After stage 8, count entities per kind and assert equality with the stage 5 + stage 7 inventory; re-hydrate
+        the affected section on mismatch.
+      na_reason: This Phase 2, Stage 8 check counts entities per kind in the hydrated YAML and compares the totals against
+        the planned inventory from stage_05.json plus the Stage 7 narrative. It is N/A because Stages 5 and 7 produced no
+        entity inventory for this task, so there is no planned count to enforce against the hydrated output.
+      code: S8C6
+    - id: every_key_in_the_yaml_is_allowed_by_the_closed
+      scope: per-task
+      what: '**No fabricated fields** — every key in the YAML is allowed by the closed Pydantic schema (catches LLM-invented
+        properties).'
+      why: Fabricated fields (`world.repos[0].priority` when the schema has no such field) get silently dropped by Pydantic
+        — info the prompt promised the agent is missing at runtime.
+      suggestion: Configure the gym's Pydantic models with `extra='forbid'` and validate the hydrated YAML through them as
+        the stage 8 exit gate.
+      na_reason: This Phase 2, Stage 8 check loads the hydrated YAML through the gym's closed Pydantic schema to catch LLM-invented
+        keys. It is N/A because this gym's schema is open/dict-typed rather than a closed Pydantic model, so unknown keys
+        cannot be detected by schema validation.
+      code: S8C7
+    - id: when_a_variant_family_shares_a_skeleton_the_hydrated
+      scope: per-batch
+      what: '**Distractor identities differ across variants** — when a variant family shares a skeleton, the hydrated distractor
+        names must vary (per-task analog of `cross_variant_entity_consistency`).'
+      why: If distractor names repeat across variants, leakage_linter's `cross_variant_entity_consistency` fires and the variants
+        are effectively the same task — agent caching one answer beats the whole family.
+      suggestion: 'Port `cross_variant_entity_consistency` to per-task: assert distractor name sets are disjoint across siblings
+        of the same skeleton.'
+      code: S8C8
+    code: S8
+  - name: Stages 8a + 8b — Visual findings
+    id: stages_8a_8b_visual_findings
+    summary: If 5c planned visual findings, 8a writes screenshot prompts from world context; 8b renders them (Chrome or Pillow)
+      and injects `content_base64` into the YAML.
+    files:
+    - stages/s08a_visual_prompts.py
+    - stages/s08b_screenshots.py`.
+    checks:
+    - id: every_visual_finding_from_5c_has_either_a_generated
+      scope: per-task
+      what: Every visual finding from 5c has either a generated screenshot OR a scoped lint-ignore annotation (deliberate-defect
+        path).
+      why: A planned visual finding without an image means the agent can never observe the evidence it's expected to triangulate
+        from — that reward becomes unreachable and the golden breaks.
+      suggestion: 'In stage 8b, iterate stage 5c''s visual findings and assert each has either `content_base64` or an explicit
+        `# lint-ignore: VISUAL_MISSING` rationale.'
+      na_reason: This check belongs to Phase 2, Stages 8a/8b (Visual findings), which only run when Stage 5c declared a visual-findings
+        plan. It cross-references each planned finding to either a screenshot artifact or a scoped lint-ignore. It is N/A
+        because this task's Stage 5c declared no visual findings, so there is no plan to satisfy.
+      code: S8aC1
+    - id: image_urls_follow_the_gym_s_namespace_convention
+      scope: per-task
+      what: Image URLs follow the gym's namespace convention.
+      why: Off-namespace URLs slip past the in-container asset server and 404 in the browser — the agent screenshot tool returns
+        an error placeholder and the task appears broken.
+      suggestion: Validate hydrated image URLs against the gym's namespace regex (e.g. `^/static/visuals/<task_id>/…`) in
+        stage 8b's exit gate.
+      na_reason: This Phase 2, Stage 8b check inspects image URLs emitted into the hydrated YAML and confirms they follow
+        the gym's namespace convention. It is N/A because this task renders no image URLs — either no visual findings were
+        planned in Stage 5c, or media is embedded only as inline base64 blobs with no URL surface.
+      code: S8aC2
+      script: audit/scripts/s08_visual_and_lint.py::image_urls_follow_namespace_convention
+    - id: no_bare_relative_paths_in_any_agent_rendered_content
+      scope: per-task
+      what: No bare relative paths in any agent-rendered content.
+      why: A bare `./screenshot.png` resolves differently depending on which page the agent is on — same content renders or
+        breaks across surfaces, producing flaky goldens.
+      suggestion: Scan all agent-rendered string fields for bare relative paths (`^\./` or `^[^/]+\.(png|jpg|svg)`) and reject
+        with a fix-path message.
+      na_reason: This Phase 2, Stage 8a/8b check scans every agent-rendered string in the hydrated YAML for bare relative
+        paths (which would break in the runtime sandbox). It is N/A because this task's agent-rendered content contains no
+        path-like strings — no embedded assets or filesystem references for the rule to evaluate.
+      code: S8aC3
+      script: audit/scripts/s08_visual_and_lint.py::no_bare_relative_paths_in_rendered_content
+    - id: embedded_media_blobs_decode_match_an_allowed_mime_type
+      scope: per-task
+      what: Embedded media blobs decode + match an allowed MIME type.
+      why: A corrupted or wrong-MIME blob silently fails to render in the agent's browser — visual evidence is missing and
+        the agent can't possibly find the answer the reward expects.
+      suggestion: In stage 8b, base64-decode each `content_base64`, sniff with `imghdr`/`filetype`, and assert MIME is in
+        the gym's allowlist.
+      na_reason: This Phase 2, Stage 8b check base64-decodes every `content_base64` payload in the hydrated YAML and matches
+        its sniffed MIME type against the allow-list. It is N/A because this task injected no embedded media blobs — no `content_base64`
+        payloads exist to decode.
+      code: S8aC4
+      script: audit/scripts/s08_visual_and_lint.py::embedded_media_blobs_decode
+    - id: visual_prompt_text_contains_no_answer_leakage_run_hint
+      scope: per-task
+      what: Visual-prompt text contains no answer leakage (run hint scanner over it).
+      why: Leakage inside the visual prompt ends up baked into the rendered image as visible text (e.g. screenshots of dashboards
+        captioned 'this is the misconfigured one') — the agent reads the answer off the picture.
+      suggestion: Run `_check_answer_hints` over each visual-prompt string before stage 8b renders; fail-fast on matches.
+      na_reason: This Phase 2, Stage 8a check runs the hint-leak scanner over the visual prompt text produced by `s08a_visual_prompts.py`.
+        It is N/A because Stage 8a was skipped entirely — Stage 5c declared no visual findings, so no visual prompts were
+        generated.
+      code: S8aC5
+    - id: visual_prompts_reference_entities_that_exist_in_the
+      scope: per-task
+      what: Visual prompts reference entities that exist in the hydrated YAML (no "render entity Foo" when Foo isn't in the
+        world).
+      why: If the prompt asks the renderer to draw an entity that isn't in the hydrated world, the image either invents a
+        name (creating a phantom distractor) or renders nothing — both wreck triangulation.
+      suggestion: Extract entity references from visual prompts and assert each resolves to a hydrated `world.*.id` before
+        stage 8b runs.
+      na_reason: This Phase 2, Stage 8a check parses entity references out of visual-prompt text and confirms each named entity
+        actually exists in the hydrated world YAML (no "render entity Foo" when Foo is undefined). It is N/A because the task
+        either produced no visual prompts at all, or its visual prompts contain no entity references to resolve.
+      code: S8aC6
+    code: S8a
+  - name: Post-hydration hint gate
+    id: post_hydration_hint_gate
+    summary: Scans every agent-visible string for answer leakage ("do not migrate", "out of scope", "this is the bug") and
+      rewrites via LLM. Skips `task_design_commentary` and `task.coverage` (reviewer-only fields).
+    files:
+    - stages/s08_post_hydration_gate.py`.
+    checks:
+    - id: re_run_the_hint_scanner_on_the_post_gate_output_expect
+      scope: per-task
+      what: Re-run the hint scanner on the post-gate output; expect zero matches.
+      why: If the rewriter LLM only partially scrubbed leakage, the residue still tells the agent the answer — gate appears
+        to have run but the task remains a free win.
+      suggestion: After the gate, re-execute `_check_answer_hints` over every agent-visible field and assert empty matches;
+        loop the rewriter on residue.
+      na_reason: This check sits at the Phase 2 post-hydration hint gate (`s08_post_hydration_gate.py`), which scans every
+        agent-visible string in the hydrated YAML for answer-leakage patterns and expects zero matches after rewriting. It
+        is N/A because the gate was not invoked for this task — typical for gyms that skip the post-hydration gate or whose
+        YAML contains no agent-visible strings beyond schema scaffolding.
+      code: HGC1
+    - id: field_scope_correctness_scanner_did_not_rewrite
+      scope: per-task
+      what: 'Field-scope correctness: scanner did not rewrite reviewer-only fields (commentary, coverage manifest, etc.).'
+      why: Rewriting `task_design_commentary` or `task.coverage` corrupts reviewer-facing rationale and the coverage manifest
+        — auditors lose the trail used to debug failed tasks.
+      suggestion: Pass an explicit allowlist of agent-visible field paths into the gate, and assert reviewer-only fields are
+        byte-identical pre/post.
+      na_reason: This Phase 2 post-hydration check confirms the gate left reviewer-only fields (`task_design_commentary`,
+        `task.coverage`) untouched while rewriting only agent-visible strings. It is N/A because this task's hydrated YAML
+        contains no reviewer-only fields, so there is no protected region whose preservation could be evaluated.
+      code: HGC2
+    - id: reword_diff_size_is_small_each_replaced_span_2
+      scope: per-task
+      what: 'Reword diff size is small: each replaced span ≤ 2× original length (catches over-rewriting that changes semantics).'
+      why: An over-eager rewriter can paraphrase a leaky sentence into a different semantic claim — the prompt now describes
+        a task that doesn't match the hydrated world, breaking grounding.
+      suggestion: Diff replaced spans and reject any rewrite > 2× the original length; require the rewriter to re-emit a tighter
+        version.
+      na_reason: This Phase 2 post-hydration check measures each rewritten span against its original (≤ 2× length) to catch
+        over-rewriting that changes semantics. It is N/A because the hint scanner found zero spans to rewrite for this task,
+        so no diff exists to size-check.
+      code: HGC3
+    - id: cross_field_consistency_when_a_hint_mentions_an_entity
+      scope: per-task
+      what: 'Cross-field consistency: when a hint mentions an entity (e.g. "this artifact X is the bug"), the reworded text
+        still mentions a comparable entity (the gate didn''t silently delete the reference).'
+      why: If the gate deletes the entity reference while scrubbing the hint, the prompt no longer grounds the reward — `prompt_grounds_reward_entities`
+        breaks downstream and the task becomes unsolvable.
+      suggestion: After rewrite, extract entity mentions from the original span and assert at least one comparable mention
+        remains in the rewritten span.
+      na_reason: 'This Phase 2 post-hydration check compares pre- and post-rewrite text: when an original hint referenced
+        an entity, the rewritten replacement must still mention a comparable entity (the gate must not silently delete references).
+        It is N/A because none of the rewritten hints mentioned any entity, so there is no cross-field entity reference whose
+        preservation could be verified.'
+      code: HGC4
+    code: HG
+- name: Phase 3 — Quality gates
+  id: phase_3_quality_gates
+  corpus: draft
+  corpus_path: task-designer/drafts/
+  stages:
+  - name: '`yaml_fixes.py` + reward lint-fix loop'
+    id: reward_lint_fix_loop
+    summary: Programmatic fixes that don't need an LLM pass (canonical `tools:` list, `start_url`, wiki `body`→`content`,
+      `state_unchanged` table lists, `accounted_by` auto-population, regexp quoting). Then `_lint_fix_loop` runs the reward
+      linter and either applies fixes or asks an LLM agent to repair.
+    files:
+    - yaml_fixes.py
+    - stages/reward_linter.py
+    - prompts/lint_suppressions.md`.
+    checks:
+    - id: a_reward_linter_binary_exists_and_is_wired_into_the
+      scope: gym-wide
+      what: '**Linter presence** — a reward-linter binary exists and is wired into the pipeline orchestrator.'
+      why: Without a wired-in linter, structural reward bugs (bad anchors, leaked answers, malformed assertions) ship straight
+        to snapshot and silently break grading for every run that hits them.
+      suggestion: Confirm `scripts/lint_tasks.py` (or equivalent) is invoked by the pipeline orchestrator and that its exit
+        status gates promotion.
+      code: LFLC1
+      script: audit/scripts/lint_and_golden.py::reward_linter_exists_and_wired
+    - id: every_rule_listed_in_the_gym_s_lint_rule_manifest
+      scope: gym-wide
+      what: '**Rule coverage** — every rule listed in the gym''s lint-rule manifest exists in the linter codebase.'
+      why: A rule listed in the manifest but absent from the codebase is a silent no-op — authors think a guard is enforced
+        when nothing is checking, so the corresponding failure class leaks through.
+      suggestion: Cross-check the manifest against `task-designer/stages/{reward,evidence,leakage,accounted_by_type,reward_pair}_linter.py`
+        and fail the audit on any orphan rule.
+      code: LFLC2
+      script: audit/scripts/lint_and_golden.py::every_lint_rule_in_manifest_exists
+    - id: has_zero_unresolved_blocking_findings_any_suppression
+      scope: per-task
+      what: '**Blocking categories clean** — `lint_findings.json` has zero unresolved blocking findings; any suppression has
+        a `# lint-ignore:` comment with scope.'
+      why: Unresolved blocking findings mean a known reward-grading bug (e.g. answer leak, unrendered anchor) ships; un-rationalized
+        suppressions turn into load-bearing magic nobody dares remove.
+      suggestion: 'Parse `lint_findings.json` for `severity: blocking` and require every `# lint-ignore:` to be paired with
+        a rationale comment block.'
+      na_reason: This check belongs to Phase 3's reward lint-fix loop and reads the per-task `lint_findings.json` artifact
+        produced after `yaml_fixes.py` and the reward linter run. It only applies when the linter raised at least one finding
+        in a blocking category; this task's run emitted zero such findings, so there is nothing to mark resolved and no suppression
+        directive to validate.
+      code: LFLC3
+      script: audit/scripts/s08_visual_and_lint.py::blocking_lint_findings_clean
+    - id: finding_count_after_fix_loop_before_any_net_new
+      scope: per-task
+      what: '**No silent drops** — finding count after fix loop ≤ before; any net-new findings mean the loop regressed.'
+      why: If the fix loop introduces new findings while clearing old ones, the LLM repair drifted the YAML — a regen could
+        silently relocate the bug or break the golden trajectory.
+      suggestion: Diff finding counts pre/post fix loop in `_lint_fix_loop` and treat any net-new finding as a hard failure.
+      na_reason: This is a Phase 3 lint-fix-loop regression check that diffs the pre-loop vs post-loop counts in `lint_findings.json`.
+        With no findings at loop entry there is no baseline to regress against — the comparison `after ≤ before` is vacuously
+        satisfied, so the auditor records it as N/A rather than a meaningful pass.
+      code: LFLC4
+    - id: every_carries_a_one_line_reason_auditor_flags
+      scope: per-task
+      what: '**Suppression discipline** — every `# lint-ignore` carries a one-line reason; auditor flags suppressions without
+        rationale.'
+      why: An unjustified `# lint-ignore` ages into untouchable cruft — future authors can't tell if it's a real design choice
+        or a shortcut, so genuine bugs hide behind it.
+      suggestion: Grep YAMLs for `# lint-ignore:` lines lacking an adjacent `Rationale:` block and fail the audit on any naked
+        suppression.
+      na_reason: This check inspects the shipped task YAML in `task-designer/worlds/` for `# lint-ignore:` header directives
+        produced during the Phase 3 lint-fix loop. The task's YAML contains no such directives — every finding was fixed outright
+        rather than suppressed — so there are no rationale comments for the auditor to scrutinize.
+      code: LFLC5
+    - id: number_of_llm_repair_iterations_else_flag_loop_budget
+      scope: per-task
+      what: '**Loop terminates** — number of LLM repair iterations < `config.lint.max_attempts` (else flag "loop budget exhausted,
+        ship anyway" as a smell).'
+      why: Hitting `max_attempts` means the loop gave up rather than converged — the YAML likely ships with residual lint
+        debt that will surface as broken grading or drifted goldens later.
+      suggestion: Have the orchestrator emit `iterations_used` and flag tasks where it equals `config.lint.max_attempts` as
+        smell-only ship.
+      na_reason: This Phase 3 check reads the loop telemetry recorded by `_lint_fix_loop` to confirm iterations stayed under
+        `config.lint.max_attempts`. For this task, `yaml_fixes.py` and the deterministic fix-ups cleared every finding before
+        any LLM repair agent was invoked, so the iteration counter is zero and the budget cap is trivially honored.
+      code: LFLC6
+    code: LFL
+  - name: Stage 10 — Guide audit
+    id: stage_10_guide_audit
+    summary: 'Runs `scripts/guide_task_design.py` (static + LLM review): undisclosed constraints, reward-hacking review, narrative
+      coherence.'
+    files:
+    - stages/s10_validate.py
+    - scripts/guide_task_design.py`.
+    checks:
+    - id: findings_carry_a_category_severity_and_a_yaml_pointer
+      scope: per-task
+      what: Findings carry a category, severity, and a YAML pointer (jsonpath or file:line).
+      why: Findings without a YAML pointer can't be auto-applied by stage 11 refine, and missing severity means blocking issues
+        blur with cosmetic ones — both lead to half-fixed tasks shipping.
+      suggestion: Validate `guide_task_design.py` output schema requires `{category, severity, path}` and reject runs with
+        bare-text findings.
+      na_reason: This check reads the Stage 10 guide-audit output (from `scripts/guide_task_design.py`) and validates that
+        each finding entry carries category, severity, and a YAML pointer. Stage 10 returned an empty findings list for this
+        task, so there are no entries to inspect for required metadata.
+      code: S10C1
+    - id: reward_hacking_review_specifically_reasons_about_each
+      scope: per-task
+      what: Reward-hacking review specifically reasons about each reward in turn — auditor counts review entries vs reward
+        count and flags any reward never mentioned.
+      why: If a reward is never mentioned in the hacking review, no one checked whether it can be gamed — the agent may earn
+        free credit via a shortcut the review never imagined.
+      suggestion: Count `review_entries` per `reward.id` and require ≥1 entry per reward; flag any unreviewed reward in the
+        audit report.
+      na_reason: This Phase 3, Stage 10 check counts entries in the reward-hacking review pass and compares them to the task's
+        declared reward count. The pass did not produce a review record for this task — typically because the LLM review sub-pass
+        was skipped or the task declares no rewards to reason about — so there is nothing to count.
+      code: S10C2
+    - id: llm_review_confidence_is_recorded_cheap_judgment_vs
+      scope: per-task
+      what: LLM review confidence is recorded (cheap-judgment vs strong-judgment).
+      why: Without confidence tagging, a low-conviction LLM hunch is treated the same as a strong finding — stage 11 wastes
+        refine budget on noise while real bugs get the same priority as guesses.
+      suggestion: 'Require the guide-audit output to include a `confidence: {cheap,strong}` field per finding and surface
+        the distribution.'
+      na_reason: This check reads the confidence field that the Stage 10 LLM review pass writes alongside its findings. The
+        task's guide audit completed using only the deterministic static checks; the LLM review sub-pass never ran, so no
+        confidence value was emitted to evaluate.
+      code: S10C3
+    - id: audit_re_runs_are_stable_re_running_stage_10_on_the
+      scope: per-stage
+      what: 'Audit re-runs are stable: re-running stage 10 on the same input must produce the same finding count ± small noise
+        budget.'
+      why: An unstable guide-audit means the gate is non-deterministic — a task that passes today may fail tomorrow with the
+        same YAML, so audit verdicts can't be trusted as ship signals.
+      suggestion: Run stage 10 twice on a sample and fail if finding-count variance exceeds the configured noise budget (e.g.
+        ±2).
+      code: S10C4
+    code: S10
+  - name: Stage 11 — Refine
+    id: stage_11_refine
+    summary: Claude Agent SDK fixes the YAML based on stage-10 findings, batched by category.
+    files:
+    - stages/s11_refine.py`.
+    checks:
+    - id: net_finding_count_after_refine_before_no_progress_is_a
+      scope: per-task
+      what: Net finding count after refine < before (no-progress is a fail-state).
+      why: If refine doesn't reduce findings, the LLM either gave up or applied null edits — the task ships with the same
+        defects stage 10 caught, wasting the whole gate.
+      suggestion: In the refine orchestrator, compare pre/post finding counts and fail the stage when delta ≥ 0.
+      na_reason: This Phase 3, Stage 11 check compares finding counts in the Stage 10 audit before and after the refine agent's
+        edits. Refine was never invoked for this task because Stage 10 emitted zero findings, so there is no before/after
+        delta to score for progress.
+      code: S11C1
+    - id: no_new_blocking_findings_introduced_auditor_diffs
+      scope: per-task
+      what: No new blocking findings introduced — auditor diffs before/after and flags any net-new `BLOCKING_*` category.
+      why: Refine can over-edit and introduce new blockers (e.g. break an anchor while fixing a leak) — without diff-checking,
+        the task regresses silently past stage 11 with worse defects than it entered.
+      suggestion: Diff stage-10 vs stage-11 findings by category and hard-fail on any net-new `BLOCKING_*` entry.
+      na_reason: This check diffs the Stage 10 finding sets before and after Stage 11 to ensure refine introduced no new `BLOCKING_*`
+        categories. Stage 11 was skipped entirely for this task — there were no findings to drive a refine pass — so no diff
+        exists to inspect.
+      code: S11C2
+    - id: diff_is_targeted_edits_touch_only_sections_referenced
+      scope: per-task
+      what: 'Diff is targeted: edits touch only sections referenced in findings (no full-file rewrites).'
+      why: Full-file rewrites mean refine reshaped sections nobody asked it to — narrative, entity ids, or goldens may drift,
+        breaking trajectories that previously graded correctly.
+      suggestion: Compute the YAML diff against the finding pointers and flag any edit outside the cited jsonpaths.
+      na_reason: This Stage 11 check examines the YAML diff the refine agent produced and verifies edits stay within sections
+        cited by Stage 10 findings. With no findings to act on, the refine stage produced no diff for this task, so there
+        is nothing to evaluate for targeting.
+      code: S11C3
+    - id: refined_yaml_still_passes_linter_no_regressions_on
+      scope: per-task
+      what: Refined YAML still passes linter (no regressions on rules already clean).
+      why: Refine fixing one guide finding while breaking a previously-clean lint rule means the task moves laterally — net
+        quality stays flat or drops, defeating the gate.
+      suggestion: Re-run `lint_tasks.py` after refine and fail on any rule that was clean pre-refine but fires post-refine.
+      na_reason: This check re-runs the reward linter on the Stage 11 refined YAML to confirm previously clean rules stayed
+        clean. Because Stage 11 never ran for this task, no refined YAML exists to re-lint.
+      code: S11C4
+    - id: entity_count_reward_count_unchanged_before_after
+      scope: per-task
+      what: Entity count + reward count unchanged before/after refine (no silent drops while fixing).
+      why: A silent reward drop during refine means a grading dimension disappeared — the task suddenly scores easier without
+        any reviewer noticing the missing check.
+      suggestion: Snapshot `len(entities)` and `len(rewards)` pre/post refine and assert equality in the stage-11 post-check.
+      na_reason: This Stage 11 check compares entity and reward counts in the pre-refine vs post-refine YAML to catch silent
+        drops during fixes. Refine was bypassed for this task, so there is no post-refine YAML to diff against the pre-refine
+        version.
+      code: S11C5
+    code: S11
+  - name: Stage 12 — Blind judge
+    id: stage_12_blind_judge
+    summary: Sonnet does a **blind A/B comparison** vs `task_001_licensing_audit_hard.yaml` (random side assignment).
+    files:
+    - stages/s12_judge.py
+    - prompts/judge.md`.
+    checks:
+    - id: side_assignment_is_recorded_and_randomized_auditor
+      scope: per-batch
+      what: Side assignment is recorded and randomized (auditor checks the side-assignment log for ~50/50 distribution across
+        a batch).
+      why: Without recorded random side assignment, the judge may have a positional bias (A-side favoritism) that masquerades
+        as a real quality verdict — promotions become coin flips.
+      suggestion: Audit the side-assignment log for ~50/50 distribution per batch and fail on skew beyond a configured threshold.
+      code: S12C1
+    - id: verdict_has_scores_on_every_required_dimension_reward
+      scope: per-task
+      what: Verdict has scores on every required dimension (reward specificity, distractors, chain depth, narrative, coverage,
+        UI).
+      why: A missing dimension means the judge skipped a quality axis — e.g. no distractor score lets weakly-distracted tasks
+        promote, eroding gym difficulty calibration.
+      suggestion: Schema-validate judge output against the required dimension list (reward specificity, distractors, chain
+        depth, narrative, coverage, UI) and reject incomplete verdicts.
+      na_reason: This Phase 3, Stage 12 check reads the blind A/B verdict file produced by `s12_judge.py` and confirms every
+        required dimension is scored. The judge stage did not run for this task — typically because judging was disabled in
+        config or the reference comparison task was unavailable — so no verdict artifact exists.
+      code: S12C2
+    - id: reasoning_cites_concrete_yaml_sections_line_numbers
+      scope: per-task
+      what: Reasoning cites concrete YAML sections (line numbers / jsonpaths) — no vague "this task is better" claims.
+      why: Vague reasoning isn't actionable for stage 13 improve and can't be audited — the judge's verdict becomes an opaque
+        preference rather than a defensible quality signal.
+      suggestion: Require judge output to include jsonpath or line citations per dimension and reject reasoning blocks lacking
+        concrete pointers.
+      na_reason: This check inspects the Stage 12 judge's reasoning text for concrete YAML citations (line numbers or jsonpaths).
+        Since the blind judge was not invoked for this task, there is no reasoning artifact to scan for citation quality.
+      code: S12C3
+    - id: auditor_spot_runs_judge_with_sides_swapped_on_a_sample
+      scope: per-batch
+      what: Auditor spot-runs judge with sides swapped on a sample of N tasks and expects consistent preferences (a flippy
+        judge means weak criteria).
+      why: A flippy judge means the criteria are too soft to distinguish tasks — promotion verdicts are noise, and the baseline
+        comparison stops being a meaningful gate.
+      suggestion: On a sample of N tasks per batch, swap sides and re-run the judge; flag any preference reversal as a criteria-weakness
+        smell.
+      code: S12C4
+    code: S12
+  - name: Stage 13 — Improve
+    id: stage_13_improve
+    summary: Up to `max_improvement_rounds` LLM passes applying judge feedback.
+    files:
+    - stages/s13_improve.py`.
+    checks:
+    - id: improvement_diff_targets_only_judge_flagged_sections
+      scope: per-task
+      what: Improvement diff targets only judge-flagged sections (no full rewrites).
+      why: A full rewrite during improve drifts narrative, entity ids, or goldens — trajectories that previously graded correctly
+        may break, and the change is too broad to review.
+      suggestion: Diff the improve edits against the judge's cited sections and fail on edits outside the flagged jsonpaths.
+      na_reason: This Phase 3, Stage 13 check examines the improvement-pass diff and verifies edits stay within sections flagged
+        by Stage 12's judge verdict. Stage 13 produced no diff for this task because Stage 12 returned no actionable feedback
+        (or did not run at all), so there is nothing to evaluate.
+      code: S13C1
+    - id: post_improvement_judge_run_shows_non_decreasing_score
+      scope: per-task
+      what: Post-improvement judge run shows non-decreasing score on every dimension.
+      why: If any dimension regresses post-improve, the LLM traded one weakness for another — net quality stays flat or worse,
+        defeating the iteration budget.
+      suggestion: Re-run the blind judge after improve and assert every dimension's score is ≥ its pre-improve value.
+      na_reason: This check re-runs the Stage 12 blind judge after Stage 13 and confirms scores did not drop on any dimension.
+        Stage 13 was skipped for this task — no judge feedback drove an improvement pass — so no post-improvement judge run
+        exists to compare.
+      code: S13C2
+    - id: reward_count_unchanged_before_after_improvement
+      scope: per-task
+      what: Reward count unchanged before/after improvement.
+      why: A silent reward drop during improve removes a grading axis — the task suddenly scores easier, masking the regression
+        as an apparent quality gain.
+      suggestion: Snapshot reward count pre/post improve in the orchestrator and assert equality before accepting the round.
+      na_reason: This Stage 13 check compares the reward count in the YAML before and after the improvement pass to catch
+        silent drops. Because Stage 13 never executed for this task, there is no post-improvement YAML to diff against the
+        pre-improvement version.
+      code: S13C3
+    - id: linter_remains_clean_after_improvement_no_regressions
+      scope: per-task
+      what: Linter remains clean after improvement (no regressions).
+      why: Improve can introduce new lint findings (broken anchors, leaked answers) while polishing narrative — the task ships
+        with structural reward bugs that linting was supposed to block.
+      suggestion: Re-run `lint_tasks.py` after each improve round and fail on any new finding.
+      na_reason: This check re-runs the reward linter on the Stage 13 output to confirm improvement edits introduced no regressions.
+        Stage 13 was bypassed for this task, so no post-improvement YAML exists to re-lint.
+      code: S13C4
+    - id: total_llm_rounds_used_if_equal_log_it_as_a_quality
+      scope: per-task
+      what: Total LLM rounds used ≤ `max_improvement_rounds`; if equal, log it as a quality smell.
+      why: Hitting `max_improvement_rounds` means improvement never converged — the task likely ships with residual judge-flagged
+        weaknesses, just below the no-progress threshold.
+      suggestion: Emit `rounds_used` in the stage-13 report and flag tasks where it equals `max_improvement_rounds` as smell-only
+        ship.
+      na_reason: This Phase 3, Stage 13 check reads the round counter against `max_improvement_rounds` to detect tasks that
+        exhausted the budget. The task consumed zero improvement rounds because Stage 12 surfaced no judge-driven changes
+        to apply, so the cap is trivially honored and there is no smell to log.
+      code: S13C5
+    code: S13
+- name: Phase 4 — Ship
+  id: phase_4_ship
+  corpus: draft
+  corpus_path: task-designer/drafts/
+  stages:
+  - name: Final audit + Opus corrective pass
+    id: final_audit_opus_corrective_pass
+    summary: Runs `s10_validate` + `guide_task_design.py` once more; batched Opus Agent SDK fixes any remaining audit issues;
+      final lint-fix loop with the same blocking categories.
+    files:
+    - run.py` `_final_audit
+    - stages/reward_linter.py`.
+    checks:
+    - id: final_lint_findings_count_0_in_blocking_categories
+      scope: per-task
+      what: Final lint findings count = 0 in blocking categories (else block ship).
+      why: Shipping with blocking findings (anchor leaks, citation gaps, reward/evidence mismatches) lets broken tasks reach
+        Taiga where they either grade wrong or hand the agent free credit via leaked answers.
+      suggestion: Gate `make taiga build` on `scripts/lint_tasks.py --min-severity high` returning zero — fail the ship step
+        instead of warning.
+      na_reason: 'This check belongs to Phase 4 — Ship (Final audit + Opus corrective pass) and reads the final reward-linter
+        findings against blocking categories before the task is allowed to ship. It is not applicable when the task''s YAML
+        carries documented `# lint-ignore: <CATEGORY>` headers with a written rationale tied to an intentional design pattern
+        (e.g. an audit task that deliberately discloses drift across multiple surfaces), so the blocking finding is structurally
+        accurate but suppressed on purpose.'
+      code: FAC1
+    - id: idempotency_re_running_the_final_audit_must_produce
+      scope: per-stage
+      what: 'Idempotency: re-running the final audit must produce identical findings (no flakiness across runs).'
+      why: Non-deterministic findings mean an Opus pass that 'fixes' a finding may just be chasing noise; the next regen reintroduces
+        or invents new findings and goldens drift run-over-run.
+      suggestion: Seed all linter LLM-judge calls and sort finding output in `s10_validate` so two back-to-back runs diff
+        to empty before declaring done.
+      code: FAC2
+    - id: reward_entity_counts_unchanged_from_stage_13_no_silent
+      scope: per-task
+      what: Reward + entity counts unchanged from stage 13 (no silent drops while fixing).
+      why: If the Opus fix silently drops a reward or entity reference while patching prose, the task ships with weaker grading
+        than the design intended and the agent can pass by ignoring the dropped behavior.
+      suggestion: Snapshot `len(rewards)` and entity-ID set before/after the corrective pass and abort the ship if they diverge
+        — wire into `final_audit` post-check.
+      na_reason: This check sits in Phase 4 — Ship (Final audit + Opus corrective pass) and compares the reward/entity counts
+        in the shipped YAML before and after the Opus corrective edits. It is not applicable when Stage 13 returned a clean
+        audit, because no corrective pass ran and there is no before/after delta to diff for silent drops.
+      code: FAC3
+    - id: opus_diff_scope_edits_limited_to_flagged_sections
+      scope: per-task
+      what: 'Opus diff scope: edits limited to flagged sections; auditor flags refactors that touch the whole task body.'
+      why: Whole-body refactors invalidate the stage-14 golden (trajectory steps reference text that no longer exists) and
+        bypass the targeted-fix invariant, so subsequent verify+fix loops compound errors instead of converging.
+      suggestion: Constrain the Opus Agent SDK call to flagged anchors only and reject diffs whose unified-diff line count
+        exceeds, e.g., 3x the flagged-region size.
+      na_reason: This check belongs to Phase 4 — Ship (Final audit + Opus corrective pass) and inspects the diff produced
+        by the batched Opus Agent SDK fix step to confirm edits stayed inside the flagged sections. It is not applicable when
+        Stage 13 surfaced no audit issues, so Opus never edited the task body and there is no diff scope to evaluate.
+      code: FAC4
+    code: FA
+  - name: Stage 14 — Golden solution
+    id: stage_14_golden_solution
+    summary: Batched LLM emits a `task_<id>_solution.yaml` describing the trajectory + final-state mutations a perfect agent
+      would produce.
+    files:
+    - stages/s14_solution.py
+    - stages/solution_helpers.py`.
+    checks:
+    - id: solution_yaml_parses_every_entity_reference_resolves
+      scope: per-task
+      what: Solution YAML parses; every entity reference resolves to a world entity.
+      why: An unresolved entity reference means the reward harness in stage 15 cannot execute the step — the golden is unrunnable
+        and the verify loop wastes its 24-attempt budget chasing a phantom ID.
+      suggestion: After emit, parse with `solution_helpers.load_solution` and cross-check every `entity_id` against the world
+        YAML's entity table before passing to stage 15.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 14 (Golden solution) and validates that `task_data/solutions/task_<id>_solution.yaml`
+        parses and that every entity reference it makes resolves back to an entity in the shipped world YAML. It is not applicable
+        to answer-only tasks whose solution is a final natural-language answer string with no entity references to resolve
+        against the world.
+      code: S14C1
+      script: audit/scripts/lint_and_golden.py::golden_solution_yaml_parses
+    - id: for_every_reward_in_the_task_the_solution_has_at_least
+      scope: per-task
+      what: '**Reward coverage** — for every reward in the task, the solution has at least one trajectory step or final-state
+        mutation that targets it.'
+      why: Uncovered rewards can never pass the harness — the verify loop will mis-diagnose this as a task bug and patch a
+        perfectly good reward away, weakening the grader.
+      suggestion: Build a reward-id → solution-step coverage map in stage 14 and require coverage ≥ 1 per reward; emit `MISSING_COVERAGE`
+        before stage 15 runs.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 14 (Golden solution) and walks each reward in the shipped task
+        YAML to confirm the solution has at least one trajectory step or final-state mutation that drives it to pass. It is
+        not applicable to tasks whose rewards are exclusively passive `pre_existing` state checks, because no agent action
+        or mutation is required to satisfy them and the solution legitimately has nothing to record.
+      code: S14C2
+    - id: no_magic_numbers_strings_every_value_in_the_solution
+      scope: per-task
+      what: No magic numbers/strings — every value in the solution is derivable from (or quoted from) the world YAML; no LLM-invented
+        identifiers.
+      why: LLM-invented identifiers or counts don't exist in the seeded DB/git server; the trajectory step fails, verify+fix
+        patches the task to match the hallucination, and the shipped task no longer reflects the world.
+      suggestion: Validate every literal in the solution against the world YAML's value-set (entities, paths, counts) and
+        reject the emit if any value is unsourced.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 14 (Golden solution) and cross-references every identifier, path,
+        and numeric literal in `task_<id>_solution.yaml` back to the world YAML to ensure nothing was invented by the LLM.
+        It is not applicable when the solution contains only natural-language reasoning or final-answer text, with no concrete
+        identifiers or values to trace back to world entities.
+      code: S14C3
+    - id: file_edit_instructions_match_schema_no_free_form_prose
+      scope: per-task
+      what: File-edit instructions match `solution_helpers.py` schema (no free-form prose where the harness expects JSON).
+      why: Free-form prose where the harness expects a JSON file-edit payload makes the step a no-op — the file mutation never
+        lands, the state reward fails, and stage 15 burns attempts diagnosing the wrong layer.
+      suggestion: Validate every file-edit step against the pydantic model in `solution_helpers.py` at emit time; refuse the
+        solution if any step is a string instead of a structured op.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 14 (Golden solution) and validates any file-edit steps in `task_<id>_solution.yaml`
+        against the JSON schema defined in `solution_helpers.py`. It is not applicable to read-only investigation or answer-only
+        tasks whose golden solution contains no file-edit steps, leaving nothing to schema-check.
+      code: S14C4
+    - id: trajectory_length_is_plausible_steps_1_step_a_one_step
+      scope: per-task
+      what: 'Trajectory length is plausible: < `config.solution.max_trajectory_length` steps; > 1 step (a one-step solution
+        is a smell).'
+      why: A one-step solution usually means the LLM compressed multi-action work into prose, so the harness can't execute
+        it; a runaway-length solution suggests the agent is brute-forcing and the task is under-constrained.
+      suggestion: Add a length-range check using `config.solution.{min,max}_trajectory_length` in stage 14's emit validator
+        and force re-emit on violation.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 14 (Golden solution) and counts the trajectory steps in `task_<id>_solution.yaml`,
+        flagging both bloated solutions (> `config.solution.max_trajectory_length`) and suspicious one-step solutions. It
+        is not applicable to pure state-set tasks whose solution is a single final-state mutation block with no stepwise trajectory
+        to measure.
+      code: S14C5
+    code: S14
+  - name: Stage 15 — Verify + fix
+    id: stage_15_verify_fix
+    summary: Runs `tests/reward_harness.py` against the compiled rewards using the emitted solution. If any reward fails,
+      LLM diagnoses + fixes either the **solution** or the **task definition**, then retries (up to `solution.fix_max_attempts`,
+      default 24).
+    files:
+    - stages/s15_solution_fix.py
+    - tests/reward_harness.py
+    - gym_github/reward_compiler/`.
+    checks:
+    - id: final_reward_harness_run_shows_no_waivers_auditor_re
+      scope: per-task
+      what: Final reward-harness run shows **N/N pass** (no waivers). Auditor re-runs the harness as an independent verification.
+      why: Any waived or skipped reward ships an ungraded behavior — the agent can violate it freely in production runs and
+        Taiga still marks the task passed, masking model regressions.
+      suggestion: Have the auditor re-invoke `tests/reward_harness.py` with `--no-waivers` after stage 15 declares success
+        and block ship on anything other than N/N.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 15 (Verify + fix) and re-runs `tests/reward_harness.py` against
+        the shipped task's compiled rewards using the emitted solution, requiring N/N pass with no waivers. It is not applicable
+        when the task's rewards cannot be exercised offline by the harness (for example, they depend on live browser state)
+        and are therefore explicitly skipped rather than executed.
+      code: S15C1
+    - id: attempts_used_burning_the_budget_is_a_quality_smell
+      scope: per-task
+      what: Attempts used < `solution.fix_max_attempts` — burning the budget is a quality smell flag.
+      why: Tasks that consume the full 24-attempt budget usually converge on a degenerate task↔solution pair that compiles
+        but no longer tests the original behavior; they pass the harness but fail Taiga QA.
+      suggestion: Emit a `HIGH_FIX_ATTEMPTS` warning at >50% budget and quarantine the task for human review before shipping
+        rather than auto-promoting it.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 15 (Verify + fix) and inspects how many of the `solution.fix_max_attempts`
+        (default 24) iterations were consumed before the harness went green, flagging budget-burn as a quality smell. It is
+        not applicable when the harness passed on the first attempt, because there is no attempt trajectory to weigh against
+        the budget.
+      code: S15C2
+    - id: diagnosis_classification_across_the_batch_fix_attempts
+      scope: per-batch
+      what: Diagnosis classification — across the batch, fix attempts split between **task** and **solution** patches roughly
+        evenly. Per-task lopsidedness ("always patched the solution") is also a smell.
+      why: Always-patch-the-solution behaviour means buggy reward definitions slip through (the LLM bent the golden around
+        them); always-patch-the-task means the goldens are wrong and we're eroding task intent to match them.
+      suggestion: Log every fix's `patch_target` in stage 15 and alert when per-task or per-batch ratios skew past, e.g.,
+        80/20 — surface in the audit report.
+      code: S15C3
+    - id: no_regression_rewards_that_passed_in_attempt_n_must
+      scope: per-task
+      what: No regression — rewards that passed in attempt N must still pass in attempt N+1; auditor checks for pass→fail
+        flips across fix iterations.
+      why: A pass→fail flip means a later fix broke an earlier-validated reward; if the loop terminates on a different green
+        set, the shipped task doesn't actually satisfy what stage 15 once verified, and goldens are unsound.
+      suggestion: Track per-reward pass history across attempts in the harness driver and hard-fail the loop on any regression
+        instead of just retrying.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 15 (Verify + fix) and walks the per-attempt harness logs to ensure
+        no reward that passed in attempt N regressed to failing in attempt N+1 as the LLM patched either the solution or the
+        task. It is not applicable when the task converged in a single attempt, because there is no N→N+1 transition for a
+        regression to occur in.
+      code: S15C4
+    - id: both_files_are_written_atomically_auditor_checks
+      scope: per-task
+      what: Both files (`generated/task_<id>.yaml` + `task_data/solutions/task_<id>_solution.yaml`) are written atomically;
+        auditor checks mtimes to confirm they were updated in lock-step.
+      why: If only the task or only the solution gets written, the next regen runs stage 15 against a stale counterpart —
+        verify passes locally but Taiga sees a task/solution mismatch and the golden trajectory grades wrong.
+      suggestion: Write both files via a tmp-then-rename pair guarded by a single try/except in the stage 15 writer and assert
+        matching mtimes (±1s) in the auditor.
+      na_reason: This check belongs to Phase 4 — Ship, Stage 15 (Verify + fix) and compares the mtimes of `generated/task_<id>.yaml`
+        and `task_data/solutions/task_<id>_solution.yaml` to confirm the fix step rewrote them in lock-step. It is not applicable
+        when Stage 15 made no edits — the harness passed on the first try — so neither file was rewritten and there is no
+        atomic-write pairing to verify.
+      code: S15C5
+    code: S15
+- name: Runtime — In-container instantiation
+  id: runtime_in_container_instantiation
+  corpus: shipped
+  corpus_path: task-designer/worlds/
+  stages:
+  - name: R1 — Load task
+    id: r1_load_task
+    summary: Reads the task definition; resolves `definition.yaml` or the consolidated `tasks_world.json`.
+    files:
+    - gym_github/task_loading.py
+    - gym_github/task.py`.
+    checks:
+    - id: matches_the_source_filename_or_the_manifest_key_no
+      scope: per-task
+      what: '`task.id` matches the source filename or the manifest key — no name drift.'
+      why: If `task.id` drifts from its filename/manifest key, snapshot lookups and replay harnesses key off the wrong row
+        — graders score task A while the orchestrator thinks it ran task B, producing silent cross-contamination.
+      suggestion: In the loader (taiga_transport / pgym_transport), assert `task.id == basename(path)` or `task.id == manifest_key`
+        immediately after `Task.model_validate`.
+      na_reason: This runtime check (R1 — Load task, in gym_github/task_loading.py) compares the loaded task's `id` field
+        against either its source filename (e.g. `task_042_foo.yaml`) or its key in a consolidated manifest, to catch name
+        drift. It is N/A when a task is loaded from a packed corpus that exposes neither a per-task filename nor a manifest
+        key — for example, an inline test fixture or an in-memory dict passed straight to the loader — so there is no external
+        identifier to compare `task.id` against.
+      code: R1C1
+      script: audit/scripts/r1_load_task.py::task_id_matches_source_filename
+    - id: every_reward_is_in_the_gym_s_registered_closed_reward
+      scope: per-task
+      what: Every reward `kind` is in the gym's registered closed reward universe.
+      why: An unregistered `kind` falls through the dispatcher, gets dropped from the reward list, and the agent silently
+        earns a higher pass rate because a real check was never executed.
+      suggestion: Validate every `reward.kind` against `gym_github.rewards`'s `@register` table at load time and raise instead
+        of warn.
+      na_reason: This R1 check walks the task's `rewards:` list and verifies each entry's `kind` appears in the gym's registered
+        reward universe (the closed set wired up in gym_github/rewards.py). It is N/A for tasks that declare zero rewards
+        — probe-only fixtures, scaffolding tasks, or smoke-test stubs — because there are no `kind` strings to validate against
+        the registry.
+      code: R1C2
+      script: audit/scripts/r1_load_task.py::every_reward_kind_in_registered_closed_set
+    - id: all_strings_exist_in_the_gym_s_registered_tool_catalog
+      scope: per-task
+      what: All `tools:` strings exist in the gym's registered tool catalog.
+      why: Unknown tool names in `tools:` either silently expose nothing (agent can't act) or get wildcarded through, letting
+        the agent invoke tools the task author never intended — both produce broken trajectories.
+      suggestion: Intersect `task.tools` with `mcp_server`'s registered tool names at load and fail closed on any miss.
+      na_reason: This R1 check reads the task's `tools:` block and confirms every named tool exists in the gym's registered
+        MCP tool catalog (the tools exposed by gym_github/mcp_server.py). It is N/A when a task omits the `tools:` block entirely
+        and inherits the gym's default tool set — there is no explicit list to cross-check, so the catalog-membership question
+        doesn't arise.
+      code: R1C3
+    - id: every_bootstrap_identity_e_g_agent_user_resolves_to_a
+      scope: per-task
+      what: Every bootstrap identity (e.g. agent user) resolves to a declared entity in the world.
+      why: If the bootstrap user/org/repo doesn't exist in the world block, R2 seeds a world the agent has no credentials
+        in — every action 401s and the trajectory looks like a refusal rather than a real attempt.
+      suggestion: After parsing `bootstrap_data`, cross-check each identity reference against the `world:` entity maps and
+        abort the task before R2 runs.
+      na_reason: This R1 check inspects the task's bootstrap identity declaration (the agent-user block consumed during task
+        setup) and confirms each referenced identity resolves to a real entity declared in the world. It is N/A for tasks
+        that declare no bootstrap identity — anonymous tasks, or tasks that run as the gym's shared-default agent user — because
+        there is no identity reference to resolve.
+      code: R1C4
+      script: audit/scripts/r1_load_task.py::bootstrap_identity_resolves
+    - id: loading_is_deterministic_same_task_id_returns_byte
+      scope: per-stage
+      what: 'Loading is deterministic: same task ID returns byte-identical Task across calls.'
+      why: Non-deterministic loading (e.g. dict iteration order, time-based defaults) means goldens recorded yesterday won't
+        replay today, and regen diffs become unreviewable noise.
+      suggestion: Load → canonical JSON dump twice in CI and `assert hash(a) == hash(b)`; sort keys and pin any `datetime.now()`
+        calls.
+      code: R1C5
+    code: R1
+  - name: R2 — Build the world
+    id: r2_build_the_world
+    summary: '`WorldBuilder` validates the `world:` block into a `WorldState`, wipes/lays-on-top of the DB per `seed_base`,
+      INSERTs all rows, `git init`s repos, creates branches, snapshots per-table checksums.'
+    files:
+    - gym_github/world_schema.py
+    - gym_github/world_builder.py`.
+    checks:
+    - id: post_build_resource_counts_db_rows_files_services_etc
+      scope: per-task
+      what: Post-build resource counts (DB rows, files, services, etc.) match the world declaration per kind.
+      why: If declared rows ≠ inserted rows, downstream `no_extra_*` guards trip on phantom rows the author never declared,
+        and `accounted_by` carve-outs miss real entities — both produce broken goldens.
+      suggestion: In `WorldBuilder.build()`, after INSERTs, `SELECT COUNT(*)` per kind and assert against `len(world.<kind>s)`.
+      na_reason: This R2 check (gym_github/world_builder.py) compares post-build resource counts — DB rows, file-tree entries,
+        declared services — against the per-kind counts in the task's `world:` block. It is N/A for tasks that ship with no
+        `world:` declaration and instead reuse the gym's stock seed database; with no declared counts there is no expected
+        value to compare the materialized world against.
+      code: R2C1
+    - id: the_post_seed_snapshot_store_exists_and_has_one_entry
+      scope: per-task
+      what: The post-seed snapshot store exists and has one entry per audited resource container.
+      why: Missing snapshot entries mean R4's reward compiler can't compute pre-state checksums, so guards like `no_extra_issues`
+        can't distinguish pre-existing rows from agent writes — agent gets free credit for the seed.
+      suggestion: After seeding, assert `len(snapshot_store) == len(audited_kinds)` and emit a manifest log line for each
+        container.
+      na_reason: This R2 check verifies that WorldBuilder produced a post-seed snapshot store with one entry per audited resource
+        container — the per-table checksums that downstream carve-out/freeze guards diff against. It is N/A when none of the
+        task's rewards rely on snapshot diffing (no `no_extra_*` guards, no freeze checks, no "only the touched row changed"
+        assertions), so the snapshot infrastructure isn't required.
+      code: R2C2
+    - id: per_item_checksums_present_not_just_aggregate_hashes
+      scope: per-task
+      what: Per-item checksums present (not just aggregate hashes) — required for carve-out freezes downstream.
+      why: Aggregate-only hashes can't carve out a single seeded row from agent-created rows at grade time — the guard either
+        passes everything or fails everything, killing precision.
+      suggestion: 'Persist `{entity_id: sha256(canonical_repr)}` rows alongside the aggregate; gate emission on per-item presence
+        in the snapshot writer.'
+      na_reason: This R2 check ensures the post-seed snapshot stores per-row (not just per-table aggregate) checksums, which
+        carve-out freeze guards need to prove that untouched rows stayed identical. It is N/A for tasks with no carve-out
+        or freeze guards downstream — an aggregate hash suffices, and per-item granularity buys nothing the rewards will actually
+        consume.
+      code: R2C3
+    - id: agent_identity_has_the_permissions_required_to_act_on
+      scope: per-task
+      what: Agent identity has the permissions required to act on every target resource (per `agent_permission_seeding` rubric
+        check).
+      why: If the agent user lacks write/admin on the target repo or membership in the target org, every reward-relevant tool
+        call 403s — trajectory shows refusal-looking failures and goldens cannot pass.
+      suggestion: After seeding, run a permission probe (or check `repo_collaborators` / `org_members` rows) for the bootstrap
+        user against each reward-target entity.
+      na_reason: This R2 check verifies the seeded agent identity holds the GitHub-style permissions (write, admin, collaborator)
+        needed to mutate every resource its rewards target — the runtime mirror of the `agent_permission_seeding` rubric check.
+        It is N/A for read-only, navigation, or QA tasks where the agent never performs mutations, so no write permissions
+        need to be seeded or verified.
+      code: R2C4
+    - id: every_external_resource_declared_in_the_world_repos
+      scope: per-task
+      what: Every external resource declared in the world (repos, services, file trees, datasets) is materialized at the expected
+        path and reachable through the gym's standard accessor.
+      why: If a declared repo isn't `git init`ed, or a file tree isn't materialized on disk, the agent's browser/CLI sees
+        a 404 — golden replays fail not because logic broke but because the world never finished setting up.
+      suggestion: After R2, walk each declared resource and assert `os.path.exists(...)` / HTTP 200 via the gym's standard
+        accessor before returning the prompt.
+      na_reason: This R2 check confirms that every external resource declared in `world:` (git repos at /tmp/.git-server,
+        services, file trees, mounted datasets) is actually materialized on disk and reachable through the gym's standard
+        accessor. It is N/A for DB-only worlds — tasks whose `world:` block declares only SQLite rows with no repos, services,
+        or file trees — because there are no external resources to materialize or reach.
+      code: R2C5
+    - id: build_is_idempotent_under_a_wipe_then_seed_base
+      scope: per-stage
+      what: Build is idempotent under a "wipe then seed" base — running twice produces identical checksums.
+      why: Non-idempotent builds mean retrying a flaky setup leaves residue (extra rows, stale branches), so guards trip on
+        yesterday's leftovers and the same task ID grades differently across runs.
+      suggestion: 'In CI, run `build()` twice with `seed_base: wipe` and diff `snapshot_store` — they must be byte-identical;
+        fix non-deterministic inserts (auto IDs, timestamps).'
+      code: R2C6
+    code: R2
+  - name: R3 — Substitute IDs
+    id: r3_substitute_ids
+    summary: '`substitute_world_ids` walks the *entire* task dict (rewards, prompt, bootstrap_data, evidence) replacing `$world${...}`,
+      `$world_number${...}`, `$next_number${...}` with live values from the maps built in R2.'
+    files:
+    - gym_github/world_builder.py:substitute_world_ids`.
+    checks:
+    - id: post_substitution_scan_zero_of_the_gym_s_substitution
+      scope: per-task
+      what: 'Post-substitution scan: zero of the gym''s substitution tokens survive in the task dict.'
+      why: A surviving `$world${...}` token gets treated as a literal string at grade time, so SQL predicates compare against
+        the raw template and silently fail — agent loses points for grader bugs.
+      suggestion: After `substitute_world_ids`, grep the serialized task dict for `$world`, `$world_number`, `$next_number`
+        and raise if any remain.
+      na_reason: This R3 check (gym_github/world_builder.py:substitute_world_ids) re-scans the fully substituted task dict
+        and asserts zero `$world${...}`, `$world_number${...}`, or `$next_number${...}` tokens survive — a leftover token
+        means a substitution slot was missed. It is N/A for tasks that author no substitution tokens at all (everything is
+        a literal value), so there is nothing for the post-scan to find or miss.
+      code: R3C1
+    - id: every_substituted_value_maps_to_a_valid_runtime_id
+      scope: per-task
+      what: Every substituted value maps to a valid runtime ID (UUID, integer, etc.) — no `None`, no `null` strings.
+      why: If a substitution map returns `None` (typo, missing entity), the placeholder becomes the literal string `"None"`
+        and predicates compare UUID columns to that string — all goldens silently fail.
+      suggestion: In the substitution walker, assert each resolved value is a non-empty `str/int/UUID` and raise with the
+        offending token path.
+      na_reason: This R3 check confirms every value written in by `substitute_world_ids` is a valid runtime identifier — a
+        real UUID or integer from the maps built in R2, never `None` or the literal string `"null"`. It is N/A for tasks that
+        perform no ID substitution at all (rewards, prompt, and evidence reference only static literal IDs), so the substitution
+        map is never consulted and there are no inserted values to validate.
+      code: R3C2
+    - id: substitution_walks_the_full_tree_auditor_checks
+      scope: per-task
+      what: Substitution walks the full tree — auditor checks recursion-depth log against expected (catches "only top-level
+        got substituted").
+      why: A shallow walker substitutes only top-level reward fields and leaves placeholders nested inside `assertions.expected`
+        or `evidence` — graders compare live IDs against templates and produce false negatives.
+      suggestion: Have the walker emit a recursion-depth log; assert depth ≥ max depth observed in the source task dict (or
+        instrument with a counter and compare).
+      na_reason: This R3 check inspects the recursion depth recorded by `substitute_world_ids` to confirm it walked the entire
+        task tree, catching regressions where only top-level keys got substituted while nested rewards/evidence were skipped.
+        It is N/A for tasks whose substitution tokens all sit at top-level keys — the walker never needs to recurse deeply,
+        so the depth-log signal carries no information.
+      code: R3C3
+    - id: substitutions_are_non_empty_when_rewards_use
+      scope: per-task
+      what: '`task.prompt` substitutions are non-empty when rewards use placeholders (catches a prompt-side regression where
+        the substitution skipped the prompt).'
+      why: If rewards reference `$world${repo.id}` but the prompt still says "the repo `$world${repo.id}`", the agent sees
+        a literal placeholder string, gets confused, and tries to navigate to that URL — task is unsolvable.
+      suggestion: After substitution, scan `task.prompt` for the same tokens used by rewards and assert they're all resolved
+        (or that none survive).
+      na_reason: This R3 check guards against a regression where `task.prompt` is skipped by the substitution walker — it
+        asserts the post-substitution prompt is non-empty whenever rewards use placeholders that should also appear in the
+        prompt. It is N/A when the prompt contains no substitution placeholders to begin with (purely static prompt text),
+        so the prompt-side walker has nothing to fail at.
+      code: R3C4
+    code: R3
+  - name: R4 — Compile rewards
+    id: r4_compile_rewards
+    summary: Each declarative `check:` reward is dispatched through the `@register` registry to a per-kind compiler (`issue`,
+      `pr`, `commit`, `file`, `wiki`, `state`, `misc`, `guards`). The compiler emits SQL + Python predicates the grader can
+      execute.
+    files:
+    - gym_github/reward_compiler/__init__.py
+    - gym_github/reward_compiler/compilers/*.py
+    - gym_github/reward_compiler/registry.py`.
+    checks:
+    - id: every_reward_kind_in_the_input_is_dispatched_count_of
+      scope: per-task
+      what: Every reward kind in the input is dispatched (count of registry hits == reward count).
+      why: If the dispatcher silently skips an unknown kind, the compiled reward list is shorter than the declared list —
+        grade time runs fewer checks than the author wrote, inflating pass rate.
+      suggestion: In the compiler driver, assert `len(compiled) == len(task.rewards)` after dispatch; fail loud rather than
+        logging a skip.
+      na_reason: 'This R4 check (gym_github/reward_compiler/registry.py) confirms each declarative `check:` reward got dispatched
+        to its per-kind compiler — the registry-hit count should equal the input reward count. It is N/A for tasks that declare
+        zero declarative `check:` rewards, e.g. tasks using only `kind: action` or `kind: answer` rewards that bypass the
+        compiler registry entirely.'
+      code: R4C1
+    - id: compiled_output_is_auditor_compiles_dry_runs_each
+      scope: per-task
+      what: 'Compiled output is **executable**: auditor compiles + dry-runs each predicate against the live snapshot and checks
+        for runtime errors (analog of `compiled_output_executes`).'
+      why: A syntactically valid compiled predicate can still raise `OperationalError` at runtime (bad column name, malformed
+        CASE) — the grader catches it as a 0.0 score, so agents lose points to compiler bugs.
+      suggestion: In CI, after R4 emit, run each predicate against the R2 snapshot with `EXPLAIN` (SQL) or `eval` (Python)
+        and assert no exceptions.
+      na_reason: This R4 check (gym_github/reward_compiler/compilers/*.py) dry-runs each compiled predicate — the SQL queries
+        and Python lambdas the compilers emit — against the live R2 snapshot and flags runtime errors. It is N/A for tasks
+        whose rewards emit no executable predicates, most commonly pure NL-judge rewards that ship a prompt to a model rather
+        than a query to the database.
+      code: R4C2
+    - id: mutual_exclusion_sets_are_pairwise_disjoint_for
+      scope: per-task
+      what: Mutual exclusion sets are pairwise disjoint for sibling verbs on the same entity (per `mutual_exclusion_between_checks`).
+      why: Overlapping mutex verbs (e.g. `closed` and `merged` both matching the same PR) cause guards to double-count, so
+        the agent can either earn duplicate credit or fail an unsatisfiable conjunction.
+      suggestion: In `reward_pair_linter` (or the compiler's mutex stage), enumerate sibling verbs per entity and assert the
+        produced ID sets are pairwise disjoint.
+      na_reason: This R4 check verifies that sibling verbs acting on the same entity (e.g. `issue.opened` vs `issue.closed`
+        on the same issue) compile to pairwise-disjoint predicate sets, so the same world state can't satisfy contradictory
+        rewards. It is N/A when the task's reward suite has no sibling verbs on a shared entity — single-verb suites, or suites
+        where each verb targets a different entity, have nothing to be mutually exclusive about.
+      code: R4C3
+    - id: populated_for_every_guard_targeting_a_write_table
+      scope: per-task
+      what: '`accounted_by` populated for every `no_extra_*` guard targeting a write-table.'
+      why: Without `accounted_by`, `no_extra_*` guards see seeded rows as agent-written and falsely fail; or carve-outs are
+        too broad and the agent gets free credit for noise rows.
+      suggestion: In `guards`/`accounted_by_type_linter`, require every `no_extra_<table>` reward to enumerate the set of
+        sibling rewards/seeds that legitimize each row.
+      na_reason: This R4 check ensures every `no_extra_*` guard (which forbids untouched rows from changing in a write-table)
+        carries an `accounted_by` list naming which positive rewards are allowed to cause writes. It is N/A for tasks that
+        declare no `no_extra_*` guards — pure read-only tasks, or tasks that intentionally leave the write surface unconstrained
+        — because the `accounted_by` field only attaches to that guard family.
+      code: R4C4
+    - id: compilation_is_compile_twice_and_diff
+      scope: per-stage
+      what: 'Compilation is **deterministic**: compile twice and diff (`compiler_output_determinism`).'
+      why: Non-deterministic compilation (set ordering, dict iteration) means today's compiled predicate diffs against yesterday's,
+        so reviewers can't tell whether a real change broke something or it's just churn.
+      suggestion: Add a `compiler_output_determinism` CI step that runs the compiler twice on the same task and diffs the
+        canonical JSON — fail on any delta.
+      code: R4C5
+    - id: when_every_reward_has_a_non_empty_evidence_block_else
+      scope: per-task
+      what: 'When `evidence_strict: true`, every reward has a non-empty evidence block — else emission fails.'
+      why: Under `evidence_strict`, a missing evidence block means QA can't trace why a reward scored as it did, and the leakage
+        linter can't verify the answer isn't directly readable from the seeded world.
+      suggestion: In the compiler's emission gate, when `task.evidence_strict`, assert each reward has `evidence:` with ≥1
+        anchor and raise the offending reward name.
+      na_reason: 'This R4 check enforces `evidence_strict: true` semantics: when the task opts into strict mode, every compiled
+        reward must carry a non-empty evidence block or compilation fails. It is N/A for tasks running with `evidence_strict:
+        false` (the default for legacy or evidence-optional tasks), where rewards may legally compile without evidence anchors.'
+      code: R4C6
+    code: R4
+  - name: R5 — Agent runs, then grade
+    id: r5_agent_runs_then_grade
+    summary: Agent drives the browser. On `grade_problem`, the gym rebuilds the trajectory from `/tmp/taiga_github_adapter/tool_calls.jsonl`
+      + the trailing assistant text, runs every compiled reward against live DB state, packages a `Grade` payload.
+    files:
+    - gym_github/server.py
+    - gym_github/taiga_transport.py
+    - gym_github/rewards.py`.
+    checks:
+    - id: subscore_count_reward_count_no_rewards_silently
+      scope: per-task
+      what: Subscore count == reward count (no rewards silently dropped at grade time).
+      why: If the grader drops a reward (exception swallowed, missing predicate), the final pass/fail ratio is wrong — a 4/5
+        grade reported as 4/4 hides a real failure.
+      suggestion: In `grade_problem`, assert `len(subscores) == len(task.rewards)` before packaging the `Grade` payload; raise
+        rather than truncate.
+      na_reason: 'This R5 check (gym_github/server.py grading path) confirms the `Grade` payload returned to Taiga contains
+        exactly one subscore per declared reward — no silent drops between R4 compilation and runtime grading. It is N/A for
+        tasks that never reach the grader at all: container crashes during R2/R3, setup failures, or hard agent timeouts produce
+        no `Grade` payload, so there are no subscores to count.'
+      code: R5C1
+    - id: every_score_0_0_1_0_no_nan_no_fractional_no_missing
+      scope: per-task
+      what: Every score ∈ {0.0, 1.0}; no NaN, no fractional, no missing.
+      why: Fractional or NaN scores break Taiga's downstream aggregation (expects boolean checks) and surface as ambiguous
+        QA states — reviewers can't tell pass from partial credit.
+      suggestion: After each reward fires, coerce to `{0.0, 1.0}` and `assert score in (0.0, 1.0)` in the grader; treat anything
+        else as a hard failure.
+      na_reason: 'This R5 check enforces the gym''s pass/fail discipline: every reward score must be exactly 0.0 or 1.0, with
+        no NaN, no fractional values, and no missing entries. It is N/A for tasks that deliberately emit fractional or weighted
+        scores — for example, partial-credit NL-judge rewards or weighted rubric scorers — where non-binary outputs are intentional
+        rather than a bug.'
+      code: R5C2
+    - id: every_failing_reward_carries_a_non_empty_message_so_qa
+      scope: per-task
+      what: Every failing reward carries a non-empty `failing_details` message (so QA can triage).
+      why: Empty `failing_details` leaves QA unable to triage — they can't tell whether the agent skipped the action, the
+        predicate is buggy, or the seed was wrong, so the finding becomes unactionable.
+      suggestion: In each `RewardFunction.__call__`, on score=0.0 require a non-empty `failing_details` and assert it before
+        returning.
+      na_reason: This R5 check inspects the grade payload's `failing_details` field for each reward that scored 0.0, requiring
+        a non-empty diagnostic string so QA can triage why the reward failed. It is N/A for runs where every reward passed
+        (a clean 1.0 across the board), because no failure messages were ever generated and there is nothing to inspect.
+      code: R5C3
+    - id: grade_payload_schema_validates_against_the_taiga
+      scope: per-task
+      what: Grade payload schema validates against the Taiga contract (no extra fields, all required fields present).
+      why: Extra or missing fields cause Taiga's ingestion to drop the row or reject the job — the task ran fine but the result
+        never reaches QA, so it looks like a flaky timeout.
+      suggestion: Validate the `Grade` dict against the Taiga pydantic schema (or `model_validate`) just before returning
+        from `grade_problem`.
+      na_reason: This R5 check validates the final `Grade` payload (assembled in gym_github/taiga_transport.py) against the
+        Taiga contract — required fields present, no extra fields, correct types. It is N/A when a task is graded through
+        a different transport, e.g. a local PGym run via `gym_github/pgym_transport.py` that emits the PGym shape instead
+        of the Taiga shape, so the Taiga schema doesn't apply.
+      code: R5C4
+    - id: re_grading_the_same_trajectory_yields_identical_scores
+      scope: per-stage
+      what: Re-grading the same trajectory yields identical scores — grader determinism.
+      why: Non-deterministic grading (e.g. live timestamps in SQL, LLM judge without temperature 0) means QA sees flapping
+        scores on the same trajectory and can't trust pass/fail signals.
+      suggestion: Add a CI step that grades a canned trajectory twice and diffs scores + failing_details; freeze any `now()`/random
+        seeds in predicates.
+      code: R5C5
+    - id: when_agent_s_golden_solution_is_replayed_expect_n_n
+      scope: per-task
+      what: When agent's golden solution is replayed, expect N/N pass (this is the runtime mirror of stage-15's harness check).
+      why: If the golden replay doesn't score N/N, the task is unsolvable as authored — every real agent attempt fails for
+        reasons unrelated to the agent's ability, polluting the pass-rate signal.
+      suggestion: Wire `make verify-goldens` (or the harness equivalent) to replay each task's recorded golden trajectory
+        and assert all subscores are 1.0.
+      na_reason: This R5 check replays the recorded golden-solution trajectory (the runtime mirror of Stage 15's harness verification)
+        and expects every reward to pass, proving the task is solvable end-to-end. It is N/A for tasks that shipped without
+        a recorded golden solution YAML in task_data/solutions/ — there is no trajectory to replay, so the round-trip check
+        can't run.
+      code: R5C6
+    code: R5

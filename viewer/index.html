@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gym Audit Viewer</title>
+  <link id="appstyle" rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1>Gym Audit Viewer</h1>
+      <span class="muted" id="session-meta"></span>
+    </div>
+    <div class="topbar-right">
+      <label for="session-select">Session:</label>
+      <select id="session-select" aria-label="Select audit session"></select>
+    </div>
+  </header>
+
+  <div class="layout layout-nosidebar">
+    <main class="page" id="page">
+      <div class="empty muted" id="empty-state">
+        <p>Select an audit session above to begin.</p>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // Cache-bust JS + CSS by their mtimes on every page load
+    fetch("/api/asset-version").then(r => r.json()).then(v => {
+      document.getElementById("appstyle").href = `/static/style.css?v=${v.style}`;
+      const s = document.createElement("script");
+      s.src = `/static/app.js?v=${v.app}`;
+      document.body.appendChild(s);
+    }).catch(() => {
+      // Fallback: timestamp
+      const t = Date.now();
+      document.getElementById("appstyle").href = `/static/style.css?v=${t}`;
+      const s = document.createElement("script");
+      s.src = `/static/app.js?v=${t}`;
+      document.body.appendChild(s);
+    });
+  </script>
+</body>
+</html>
