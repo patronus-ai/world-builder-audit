@@ -4,6 +4,10 @@ Standalone audit toolkit for procedural world-builder gyms.
 
 Walks a target gym repo against the canonical **lifecycle rubric** (141 checks across 5 phases / 25 stages), runs a battery of **deterministic Python scripts** where possible, and produces a scored Markdown report plus an interactive viewer.
 
+![Pipeline DAG view of the audit results — 5 phase lanes, one node per stage, in-circle pass/mixed/fail counts](docs/viewer-screenshot.png)
+
+> Pipeline view of an audit session — each circle is one of the 25 lifecycle stages (`S1` … `R5`). Border color summarizes the stage (green = all checks pass, yellow = mixed, red = at least one failing check). Inline counts (`3✓ 1~ 2✗`) show the per-stage pass / mixed / fail breakdown at a glance. Click any node to drill into its individual checks + evidence.
+
 ## Quick start
 
 ```bash
