@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""world-builder-audit — entry point.
+"""world-builder-audit — helper launcher (non-LLM).
 
-Prompts for the gym repo to audit (path on disk, or a git URL to clone),
-records the choice in `.last_target` so the scripts and viewer pick it up,
-and dispatches to one of three actions:
+This is NOT the full audit. The full audit is the `/gym-audit` skill in
+Claude Code, which scores all 141 checks (deterministic floor + LLM eval).
+This launcher only handles the non-LLM pieces: it prompts for the gym repo
+to audit (path on disk, or a git URL to clone), records the choice in
+`.last_target` so the scripts and viewer pick it up, and dispatches to:
 
   ./audit.py            → prompt + show menu
-  ./audit.py scripts    → run the deterministic scripts (and merge into a session)
+  ./audit.py scripts    → run only the deterministic scripts (the reproducible floor)
   ./audit.py viewer     → launch the FastAPI viewer
-  ./audit.py both       → scripts first, then viewer
+  ./audit.py both       → deterministic scripts, then viewer
+
+For the full audit, run `/gym-audit` in Claude Code instead.
 """
 from __future__ import annotations
 
@@ -21,6 +25,34 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 LAST_TARGET = REPO / ".last_target"
+
+# Modules the child scripts/viewer import. audit.py launches them with the same
+# interpreter (sys.executable), so checking here catches a missing/uninstalled
+# environment up front instead of as a nested subprocess traceback.
+REQUIRED_MODULES = {
+    "yaml": "pyyaml",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn[standard]",
+    "markdown_it": "markdown-it-py",
+}
+
+
+def _check_dependencies() -> None:
+    import importlib.util
+
+    missing = sorted(
+        pkg for mod, pkg in REQUIRED_MODULES.items()
+        if importlib.util.find_spec(mod) is None
+    )
+    if not missing:
+        return
+    raise SystemExit(
+        "Missing dependencies: " + ", ".join(missing) + "\n\n"
+        f"This toolkit must be installed before running. Using {sys.executable}\n"
+        "Install with either:\n"
+        "  uv sync                 # creates/uses .venv, then run: uv run ./audit.py\n"
+        "  pip install -e .        # into an active virtualenv\n"
+    )
 
 
 def _is_url(s: str) -> bool:
@@ -61,8 +93,10 @@ def _prompt_target() -> Path:
 
 
 def _menu() -> str:
+    print("This launcher runs the non-LLM pieces only.")
+    print("For the FULL audit (all 141 checks), run /gym-audit in Claude Code.\n")
     print("What would you like to do?")
-    print("  1) Run deterministic scripts (no LLM)")
+    print("  1) Run deterministic scripts only — the floor (no LLM)")
     print("  2) Launch the viewer (existing sessions)")
     print("  3) Both — scripts first, then viewer")
     print("  q) Quit")
@@ -86,6 +120,7 @@ def run_viewer(target: Path) -> None:
 
 def main() -> int:
     args = sys.argv[1:]
+    _check_dependencies()
     target = _prompt_target()
 
     if not args:

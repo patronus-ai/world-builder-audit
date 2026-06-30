@@ -10,31 +10,45 @@ Walks a target gym repo against the canonical **lifecycle rubric** (141 checks a
 
 ## Quick start
 
-```bash
-# 1. Install
-uv sync   # or: pip install -e .
+The audit is **full by default**: it scores all 141 checks — the deterministic
+scripts run first as the reproducible floor, then LLM evaluation covers the rest.
+Run it with the **`/gym-audit` skill inside Claude Code**, from this repo:
 
-# 2. Run (prompts for the gym to audit)
-./audit.py
-
-#    Which gym to audit? (local path OR git URL)
-#    > /path/to/some-gym
-
-# 3. Menu:
-#    1) Run deterministic scripts (no LLM)
-#    2) Launch the viewer
-#    3) Both
+```text
+1. Install:  uv sync
+2. In Claude Code, from this repo, run:  /gym-audit
+   (it prompts for the gym to audit — local path or git URL)
 ```
 
-Direct invocations:
+That single command runs the complete five-phase audit (recon → mapping →
+per-check eval → cross-cutting → synthesis) and writes a scored
+`sessions/<id>/REPORT.md`. The deterministic scripts are **Phase 2a inside it**,
+not a separate "lite" mode — there's no way to get only-deterministic from the
+skill, which is what makes the full audit the default.
+
+> The LLM phases require an agent runtime, so the full audit only runs through
+> the skill in Claude Code — not from a bare terminal.
+
+### Helper: `audit.py` (deterministic floor + viewer only)
+
+`audit.py` is a non-LLM convenience launcher. Use it to set the target, run just
+the deterministic floor, or open the viewer on existing sessions — it does **not**
+run the full audit:
 
 ```bash
-./audit.py scripts        # just run deterministic checks
-./audit.py viewer         # launch viewer at http://127.0.0.1:8765
-./audit.py both           # full flow
+uv run ./audit.py scripts        # run only the deterministic checks (the floor)
+uv run ./audit.py viewer         # launch viewer at http://127.0.0.1:8765
+uv run ./audit.py both           # deterministic scripts, then viewer
 ```
 
-The selected target is recorded in `.last_target` so subsequent runs can reuse it (just hit Enter at the prompt).
+> **Note:** run via `uv run ./audit.py`, not a bare `./audit.py`. The script's
+> shebang resolves to your system Python, which won't have the dependencies
+> installed — `uv run` (or an activated venv) points it at the right interpreter.
+> If dependencies are missing, `audit.py` fails fast with install instructions
+> instead of a confusing traceback. (Prefer `pip`? `python3 -m venv .venv &&
+> source .venv/bin/activate && pip install -e .`, then drop the `uv run` prefix.)
+
+The selected target is recorded in `.last_target` so subsequent runs (skill or `audit.py`) can reuse it (just hit Enter at the prompt).
 
 ## What's inside
 
@@ -48,8 +62,8 @@ The selected target is recorded in `.last_target` so subsequent runs can reuse i
 | `scripts/run_all.py` | Orchestrator — runs every `CHECKS = [...]` registry and merges into a session |
 | `viewer/` | FastAPI server + single-page DAG view |
 | `sessions/` | Audit results land here, one folder per session |
-| `audit.py` | CLI entry point |
-| `.claude/skills/gym-audit/` | Claude Code skill for agent-driven audit (LLM eval for the non-scripted checks) |
+| `.claude/skills/gym-audit/` | **The full audit.** Claude Code skill that runs all five phases (deterministic floor + LLM eval) — invoke via `/gym-audit` |
+| `audit.py` | Helper launcher (non-LLM): deterministic floor + viewer only |
 
 ## How the audit works
 
@@ -66,7 +80,7 @@ The skill runs the scripts FIRST, then dispatches LLM agents only for the un-scr
 2. Add a runner function to the appropriate `scripts/sXX_*.py` (or create a new one named after the stage).
 3. Register it in the file's `CHECKS = [...]` registry.
 4. Add `script: scripts/<file>.py::<fn>` to the check in `lifecycle_rubric.yaml`.
-5. Run `./audit.py scripts` against your target gym to verify.
+5. Run `uv run ./audit.py scripts` against your target gym to verify.
 
 See `scripts/README.md` for the helper API (`bucket_to_result`, `gym_wide_result`, `list_drafts`, `load_stage`, etc.).
 

@@ -34,7 +34,7 @@ def _resolve_target() -> Path:
             return p
     raise SystemExit(
         "No target gym configured. Set TARGET_GYM=/path/to/gym OR run "
-        "`python audit.py` to be prompted (it writes .last_target for the scripts to read)."
+        "`uv run ./audit.py` to be prompted (it writes .last_target for the scripts to read)."
     )
 
 

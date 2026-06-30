@@ -20,7 +20,7 @@ The audit operates on a TARGET gym. Resolution order:
 2. Fallback file **`.last_target`** at this repo's root.
 3. Otherwise: ask the user via `audit.py` and write `.last_target`.
 
-If neither is set, run `python audit.py` once (it prompts the user) before
+If neither is set, run `uv run ./audit.py` once (it prompts the user) before
 invoking any phase below.
 
 ## Rubric source
@@ -39,6 +39,12 @@ gym only grades structured state). Record "skipped: domain_specific" in the
 evidence so the report explains why.
 
 ## Procedure
+
+This skill always runs the **full** audit — all five phases, every applicable
+check. The deterministic scripts are Phase 2a (the reproducible floor), not a
+standalone mode; never stop after them or treat a deterministic-only run as a
+complete audit. Always proceed through Phase 2b (LLM eval), Phase 3
+(cross-cutting), and Phase 4 (synthesis + report).
 
 Run the five phases in order. Each phase writes a structured artifact under
 `sessions/<session_id>/<NN>-<name>.json` so later phases can read earlier output.
@@ -89,29 +95,56 @@ Write `sessions/<session_id>/01-mapping.json`.
 Goal: Run every detector and classify each check as `absent` / `partial` /
 `present`, with concrete evidence.
 
-#### Step 2a — Deterministic scripts first (no LLM)
+#### Step 2a — Deterministic scripts first (MANDATORY, no LLM)
 
-Before launching any agent, run the deterministic scripts in
-`audit/scripts/`. They cover every rubric check that carries a `script:`
-field in `audit/lifecycle_rubric.yaml`:
+The deterministic scripts are **not optional and not a subset to sample
+from** — the audit MUST run *every* available script and rely on *all* of
+their results. They cover every rubric check that carries a `script:` field
+in `lifecycle_rubric.yaml`, are byte-reproducible from the gym filesystem
+alone, and are the source of truth wherever they exist.
+
+Before launching any LLM agent, run the orchestrator (it auto-discovers and
+runs every `CHECKS = [...]` registry under `scripts/` — that is the complete
+set of available deterministic scripts):
 
 ```bash
 TARGET_GYM=/path/to/target/gym uv run python scripts/run_all.py
 ```
 
-The orchestrator merges results into the most-recent session's
-`04-scored.json` under `lifecycle_evaluations`. These results are
-**byte-reproducible** from the gym filesystem alone — no LLM judgment.
-They form the deterministic floor of the audit and are the source of
-truth wherever a script exists. Any LLM-evaluation that contradicts a
-script result is wrong by construction; skip those checks.
+This step is a hard gate. You may NOT proceed to Step 2b until all of the
+following hold:
 
-#### Step 2b — LLM evaluation for the remaining checks
+1. **It ran to completion.** `run_all.py` exited 0 and printed
+   `Ran <N> deterministic checks.` with N > 0. A non-zero exit means the
+   environment is broken (e.g. missing deps, unreadable target) — fix it and
+   re-run; do NOT skip ahead and let LLM agents cover scripted checks.
+2. **No script silently degraded.** `run_all.py` records a crashed script as
+   an `absent` result whose evidence begins `Script <file> raised:`. Scan the
+   merged `04-scored.json` for any such evidence string. If present, the
+   deterministic floor is incomplete — investigate the script (target path
+   wrong? unhandled gym shape?) and re-run until it produces a real verdict.
+   Treat a `Script … raised` result as a tooling failure to fix, NOT as a
+   genuine `absent` finding about the gym.
+3. **Coverage is complete.** Every check that carries a `script:` field in
+   `lifecycle_rubric.yaml` MUST have a corresponding entry in
+   `04-scored.json` after this run. Cross-check the two: a `script:`-bearing
+   check with no merged result means its script wasn't discovered/registered —
+   surface that as a toolkit gap; never fill it in with an LLM agent.
+
+The orchestrator merges results into the most-recent session's
+`04-scored.json` under `lifecycle_evaluations`. Any LLM evaluation that
+contradicts a script result is wrong by construction.
+
+#### Step 2b — LLM evaluation for the remaining checks ONLY
 
 For every rubric check that **does NOT** carry a `script:` field
 (Tier 3 — semantic judgment; Tier 4 — needs runtime; or simply not yet
 scripted), launch **one Agent per check** in parallel batches (cap at 16
-concurrent). Each agent receives:
+concurrent). **Never launch an agent for a check that has a `script:`
+field** — that result is already locked in from Step 2a and an LLM may not
+override, re-evaluate, or "second-guess" it, even if it looks wrong (if a
+script is genuinely wrong, fix the script, don't bypass it). Each agent
+receives:
 
 ```
 You are evaluating one check in a gym audit.
@@ -254,7 +287,7 @@ Compute scores and write the report.
 # Gym Audit Report — <target name>
 
 **Audited:** <ISO date>
-**Auditor rubric:** `audit/rubric.yaml` (schema v<N>)
+**Auditor rubric:** `lifecycle_rubric.yaml` (schema v<N>)
 **Target gym:** <target path>
 
 ## Top-line verdict
